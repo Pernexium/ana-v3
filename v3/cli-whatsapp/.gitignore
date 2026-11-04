@@ -1,0 +1,24 @@
+node_modules/
+whatsapp-session/
+whatsapp-session-manual/
+whatsapp-session-monitor/
+resultados.csv
+respuestas.csv
+*.log
+
+# Build directories
+dist/
+dist-portable/
+
+# Instalador generado
+*.exe
+
+# Archivos temporales de Node.js
+*.zip
+
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.env

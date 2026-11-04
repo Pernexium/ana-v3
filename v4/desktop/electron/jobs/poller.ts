@@ -1,0 +1,512 @@
+// File: Worker de envío. Corre en el main process.
+// Created: 2026-06-10
+// Updated: 2026-10-29
+// Author: Erick Hernández Silva
+
+import type { AuthFetch } from '../auth/tokenBroker';
+
+/**
+ * Worker de envío. Corre en el main process.
+ *
+ * Flujo con aprobación (como la asignación de v3): el poller consulta los jobs
+ * pendientes del operador (~5s) y los PUBLICA al renderer (onAssignment); NO
+ * envía nada hasta que el agente aprueba una selección (approve), opcionalmente
+ * con otra plantilla. Lo no aprobado queda pendiente en el backend y reaparece
+ * en el siguiente poll.
+ *
+ * Al enviar: agrupa por archivo (srcKey), un archivo a la vez, rate limit
+ * humano (máx 7 mensajes / 20 min, ≥2 min entre cada uno), reserva
+ * (`POST /jobs/claim`) justo antes de cada envío y ack por job con reintentos.
+ * Un envío interrumpido queda `sending` y el backend lo pasa a "por revisar".
+ * El CSV de S3 se borra solo cuando ya no quedan jobs pendientes ni reservados.
+ *
+ * Todas las llamadas usan `authFetch` (token fresco + reintento ante 401). Un
+ * 401/no-2xx/red al consultar NO publica una asignación vacía: se conserva la
+ * última publicada hasta la siguiente consulta exitosa.
+ */
+export interface SendJob {
+  jobId: string;
+  campaignId: string;
+  campaign?: string; // nombre de campaña del CRM (para registrar interacciones)
+  phone: string;
+  template: string;
+  row: Record<string, string>;
+  countryCode: string;
+  srcKey: string;
+  // pending/leased = por enviar; sending/review = por revisar (nunca se
+  // aprueban); sent/no_whatsapp/error/discarded = historial.
+  status?: 'pending' | 'leased' | 'sending' | 'review' | 'sent' | 'no_whatsapp' | 'error' | 'discarded';
+  sentAt?: number;
+  reviewAt?: number;
+  // true = envío directo (POST /send del backend): se manda sin aprobación.
+  auto?: boolean;
+}
+
+export interface Progress {
+  phase: 'idle' | 'sending' | 'waiting' | 'fileDone';
+  campaignId?: string;
+  total?: number;
+  done?: number;
+  sent?: number;
+  failed?: number;
+  waitMs?: number; // ms restantes de espera (rate limit)
+  phone?: string;
+}
+
+export interface PollerDeps {
+  apiBase: string;
+  /** ¿Hay sesión? (token presente, sin renovar). */
+  hasSession: () => boolean;
+  authFetch: AuthFetch;
+  runJob: (job: SendJob) => Promise<{ success: boolean; error?: string; noWhatsapp?: boolean }>;
+  onProgress: (p: Progress) => void;
+  /** Jobs del operador (pendientes + historial). El renderer los separa. */
+  onAssignment: (jobs: SendJob[], info: AssignmentInfo) => void;
+  /** Ritmo vigente (configuración remota); se lee en cada cálculo de espera. */
+  pace?: () => Pace;
+  /**
+   * Espera entre consultas (add-realtime-v4-desktop D3): 5 s sin canal realtime,
+   * 2 min con el canal activo. Se lee en cada espera.
+   */
+  intervalMs?: () => number;
+}
+
+/** Ritmo anti-bloqueo en ms (v4-add-desktop-remote-settings). */
+export interface Pace {
+  minGapMs: number;
+  windowMs: number;
+  maxPerWindow: number;
+}
+
+/** Totales del último poll (`truncated` = quedaron pendientes sin entregar). */
+export interface AssignmentInfo {
+  truncated: boolean;
+  pendingTotal: number;
+  historyTotal: number;
+}
+
+const EMPTY_INFO: AssignmentInfo = { truncated: false, pendingTotal: 0, historyTotal: 0 };
+
+/** Espera entre consultas sin canal realtime (comportamiento previo). */
+export const POLL_INTERVAL_MS = 5000;
+/** Espera entre consultas con el canal realtime activo (respaldo). */
+export const POLL_BACKUP_INTERVAL_MS = 2 * 60 * 1000;
+/** Ventana de coalescencia de `pollNow()` (add-realtime-v4-desktop D4). */
+export const POLL_NOW_COALESCE_MS = 1000;
+// Ritmo por defecto: ≥2 min entre mensajes, máx 7 por ventana de 20 min.
+export const DEFAULT_PACE: Pace = { minGapMs: 2 * 60 * 1000, windowMs: 20 * 60 * 1000, maxPerWindow: 7 };
+
+/** Esperas entre reintentos del acuse (v4-review-interrupted-sends D3). */
+export const ACK_RETRY_DELAYS_MS = [1000, 5000, 30_000];
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const isPending = (j: SendJob) => !j.status || j.status === 'pending' || j.status === 'leased';
+
+export class JobPoller {
+  private running = false;
+  private sending = false;
+  private paused = false; // actualización pendiente: no iniciar jobs nuevos
+  private current: Promise<unknown> | null = null; // job en curso (runJob + ack)
+  private batch: Promise<void> | null = null; // lote aprobado en curso
+  private sentAt: number[] = []; // timestamps de envíos recientes (rate limit)
+  private known = new Map<string, SendJob>(); // jobId → job (último poll)
+  private lastAssignment: SendJob[] = []; // última asignación manual publicada
+  private lastInfo: AssignmentInfo = EMPTY_INFO; // totales de la última consulta
+  private dirty = false; // pidieron consultar (evento realtime) y aún no se consulta
+  private wake: (() => void) | null = null; // despierta la espera en curso
+  private coalesce: ReturnType<typeof setTimeout> | null = null;
+
+  constructor(private deps: PollerDeps) {}
+
+  /** Asignación manual vigente (para hidratar la vista al montarse). */
+  getAssignment(): SendJob[] {
+    return this.lastAssignment;
+  }
+
+  /** Totales/truncado de la asignación vigente. */
+  getAssignmentInfo(): AssignmentInfo {
+    return this.lastInfo;
+  }
+
+  start() {
+    if (this.running) return;
+    this.running = true;
+    void this.loop();
+  }
+
+  stop() {
+    this.running = false;
+    if (this.coalesce) clearTimeout(this.coalesce);
+    this.coalesce = null;
+    this.dirty = false;
+    this.wake?.();
+  }
+
+  /**
+   * Consulta en máximo 1 s (agrupa las llamadas de ese segundo). Con un envío
+   * en curso no interrumpe: consulta al terminar el lote.
+   */
+  pollNow() {
+    if (!this.running || this.coalesce) return;
+    this.coalesce = setTimeout(() => {
+      this.coalesce = null;
+      this.dirty = true;
+      this.wake?.();
+    }, POLL_NOW_COALESCE_MS);
+  }
+
+  /** El intervalo cambió (canal activo/inactivo): recalcula la espera en curso. */
+  intervalChanged() {
+    this.wake?.();
+  }
+
+  private interval(): number {
+    return this.deps.intervalMs?.() ?? POLL_INTERVAL_MS;
+  }
+
+  /** Espera interrumpible: `wake` la despierta para recalcular o consultar ya. */
+  private sleepFor(ms: number): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const t = setTimeout(done, ms);
+      const self = this;
+      function done() {
+        clearTimeout(t);
+        if (self.wake === done) self.wake = null;
+        resolve();
+      }
+      this.wake = done;
+    });
+  }
+
+  /** Espera hasta el siguiente ciclo (intervalo vigente desde `start`) o un `pollNow`. */
+  private async waitNext(start: number) {
+    while (this.running && !this.dirty) {
+      const remaining = start + this.interval() - Date.now();
+      if (remaining <= 0) return;
+      await this.sleepFor(remaining);
+    }
+  }
+
+  /** Deja de iniciar jobs (el que esté en curso termina con su ack). */
+  pauseNewJobs() {
+    this.paused = true;
+  }
+
+  /**
+   * Vuelve a tomar jobs (la actualización a media sesión falló). Un lote
+   * aprobado que se cortó se vuelve a aprobar desde "Mi asignación".
+   */
+  resumeNewJobs() {
+    if (!this.paused) return;
+    this.paused = false;
+    this.pollNow();
+  }
+
+  /** ¿Está en pausa por actualización? */
+  isPaused(): boolean {
+    return this.paused;
+  }
+
+  /** ¿Hay un job enviándose ahora mismo? */
+  hasJobInFlight(): boolean {
+    return this.current !== null;
+  }
+
+  /** Resuelve cuando termina el job en curso (o de inmediato), máximo `timeoutMs`. */
+  async waitIdle(timeoutMs: number): Promise<void> {
+    const c = this.current;
+    if (!c) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      c.catch(() => undefined),
+      new Promise<void>((r) => (timer = setTimeout(r, timeoutMs))),
+    ]);
+    if (timer) clearTimeout(timer);
+  }
+
+  /**
+   * Envía los jobs seleccionados (en orden de asignación). `templates` trae la
+   * plantilla aprobada POR ARCHIVO (clave = `fileKey(job)`: srcKey o
+   * campaignId); cada job se envía con la de su archivo y, si no viene, con la
+   * suya. Responde en cuanto el envío arranca (no espera el lote); el avance
+   * sigue por `onProgress`. Los no seleccionados no se tocan.
+   */
+  async approve(
+    jobIds: string[],
+    templates: Record<string, string> = {},
+  ): Promise<{ ok: boolean; error?: string }> {
+    if (this.paused) return { ok: false, error: 'Actualización pendiente: no se inician envíos' };
+    if (this.sending) return { ok: false, error: 'Ya hay un envío en curso' };
+    if (!this.deps.hasSession()) return { ok: false, error: 'Sin sesión' };
+
+    const wanted = new Set(jobIds);
+    // Solo lo que sigue pendiente (nunca reenvía algo ya procesado).
+    const selected = [...this.known.values()].filter((j) => wanted.has(j.jobId) && isPending(j));
+    if (selected.length === 0) return { ok: false, error: 'Sin envíos seleccionados' };
+    // Ningún archivo puede quedar sin mensaje (el líder no fijó uno y el agente no escribió).
+    for (const j of selected) {
+      if (!(templates[fileKey(j)] ?? j.template ?? '').trim())
+        return { ok: false, error: 'Falta el mensaje de un archivo' };
+    }
+
+    this.sending = true;
+    // Arranca en el siguiente tick: la respuesta llega antes del primer envío.
+    this.batch = new Promise<void>((resolve) =>
+      setTimeout(() => {
+        void (async () => {
+          try {
+            for (const group of groupByFile(selected)) {
+              if (!this.running || this.paused) break;
+              await this.processFile(group, templates);
+            }
+          } catch (e) {
+            console.error('[poller] lote aprobado falló:', e);
+          } finally {
+            this.sending = false;
+            this.batch = null;
+            resolve();
+          }
+        })();
+      }, 0),
+    );
+    return { ok: true };
+  }
+
+  /** Lote aprobado en curso (para pruebas y diagnóstico); resuelve al terminar. */
+  currentBatch(): Promise<void> {
+    return this.batch ?? Promise.resolve();
+  }
+
+  private async loop() {
+    while (this.running) {
+      if (!this.deps.hasSession() || this.sending) {
+        // Un pollNow durante el envío queda en `dirty`: se consulta al terminar.
+        await this.sleepFor(2000);
+        continue;
+      }
+      this.dirty = false; // esta consulta cubre lo pedido hasta ahora
+      const started = Date.now();
+      await this.pollOnce();
+      await this.waitNext(started);
+    }
+  }
+
+  /** Un ciclo: consulta, publica (solo si la consulta fue exitosa) y envía directos. */
+  async pollOnce(): Promise<void> {
+    try {
+      const fetched = await this.fetchJobs();
+      if (fetched === null) return; // 401/no-2xx/red: conserva la última asignación
+      const { jobs, info } = fetched;
+      this.known = new Map(jobs.map((j) => [j.jobId, j]));
+
+      // Publica TODO (pendientes + historial): el renderer los separa en tabs.
+      this.lastAssignment = jobs;
+      this.lastInfo = info;
+      this.deps.onAssignment(jobs, info);
+      if (jobs.length === 0) this.deps.onProgress({ phase: 'idle' });
+
+      // Directos (POST /send) AÚN pendientes: se envían solos, sin aprobación.
+      const autos = jobs.filter((j) => j.auto && isPending(j));
+      if (autos.length > 0 && !this.paused) {
+        this.sending = true;
+        try {
+          for (const group of groupByFile(autos)) {
+            if (!this.running || this.paused) break;
+            await this.processFile(group);
+          }
+        } finally {
+          this.sending = false;
+        }
+      }
+    } catch {
+      /* red caída: reintenta en el próximo poll */
+    }
+  }
+
+  /** Jobs del operador o null si la consulta no fue exitosa (no publicar). */
+  private async fetchJobs(): Promise<{ jobs: SendJob[]; info: AssignmentInfo } | null> {
+    try {
+      // authFetch ya invalida el token y reintenta una vez ante 401.
+      const res = await this.deps.authFetch(`${this.deps.apiBase}/jobs/poll`);
+      if (!res.ok) return null;
+      const body = (await res.json()) as {
+        jobs: { id: string; job: SendJob }[];
+        truncated?: boolean;
+        pendingTotal?: number;
+        historyTotal?: number;
+      };
+      const jobs = body.jobs.map((j) => j.job);
+      // Backend previo sin totales: se calculan de lo recibido (nunca truncado).
+      const pending = jobs.filter(isPending).length;
+      return {
+        jobs,
+        info: {
+          truncated: body.truncated === true,
+          pendingTotal: typeof body.pendingTotal === 'number' ? body.pendingTotal : pending,
+          historyTotal: typeof body.historyTotal === 'number' ? body.historyTotal : jobs.length - pending,
+        },
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  private async processFile(group: SendJob[], templates: Record<string, string> = {}) {
+    const total = group.length;
+    let done = 0;
+    let sent = 0;
+    let failed = 0;
+    const campaignId = group[0]?.campaignId;
+    const srcKey = group[0]?.srcKey;
+    this.deps.onProgress({ phase: 'sending', campaignId, total, done, sent, failed });
+
+    for (const job of group) {
+      if (!this.running || this.paused) return;
+      await this.rateLimitWait(campaignId, total, done, sent, failed);
+      if (!this.running || this.paused) return;
+
+      // Plantilla aprobada para el archivo de ESTE job (no la de otro archivo).
+      const tpl = templates[fileKey(job)];
+      const effective = tpl !== undefined ? { ...job, template: tpl } : job;
+      const work = (async () => {
+        // Reserva justo antes de enviar (v4-review-interrupted-sends D1): si
+        // falla (409 reasignado/tomado, o red) este mensaje NO se envía.
+        const claim = await this.claim(job.jobId);
+        if (claim !== 'claimed') return { skipped: claim } as const;
+        const r = await this.deps.runJob(effective);
+        this.sentAt.push(Date.now());
+        // Marca el job (no lo borra): queda en el historial con su resultado.
+        const status = r.success ? 'sent' : r.noWhatsapp ? 'no_whatsapp' : 'error';
+        const acked = await this.ack([{ jobId: job.jobId, status }]);
+        return { r, status, acked } as const;
+      })();
+      this.current = work;
+      let outcome: Awaited<typeof work>;
+      try {
+        outcome = await work;
+      } finally {
+        this.current = null;
+      }
+      done += 1;
+      const k = this.known.get(job.jobId);
+      if ('skipped' in outcome) {
+        // 409: ya no es de este agente o ya se tomó → deja de ofrecerse.
+        if (k && outcome.skipped === 'conflict') k.status = 'sending';
+        this.deps.onProgress({ phase: 'sending', campaignId, total, done, sent, failed });
+        continue;
+      }
+      outcome.r.success ? (sent += 1) : (failed += 1);
+      // Refleja el nuevo estado en memoria (para la próxima publicación). Sin
+      // acuse queda reservado: el backend lo pasará a "por revisar".
+      if (k) k.status = outcome.acked ? outcome.status : 'sending';
+      this.deps.onProgress({
+        phase: 'sending',
+        campaignId,
+        total,
+        done,
+        sent,
+        failed,
+        phone: job.phone,
+      });
+    }
+
+    // Borra el CSV de S3 solo si ya no quedan jobs pendientes ni reservados de ese archivo.
+    const remaining = [...this.known.values()].some(
+      (j) => j.srcKey === srcKey && (isPending(j) || j.status === 'sending'),
+    );
+    if (srcKey && !remaining) await this.deleteFile(srcKey);
+    this.deps.onProgress({ phase: 'fileDone', campaignId, total, done, sent, failed });
+  }
+
+  /** Respeta gap mínimo y ventana; emite countdown mientras espera. */
+  private async rateLimitWait(
+    campaignId: string | undefined,
+    total: number,
+    done: number,
+    sent: number,
+    failed: number,
+  ) {
+    for (;;) {
+      const now = Date.now();
+      const { minGapMs, windowMs, maxPerWindow } = this.deps.pace?.() ?? DEFAULT_PACE;
+      this.sentAt = this.sentAt.filter((t) => now - t < windowMs);
+      const last = this.sentAt[this.sentAt.length - 1] ?? 0;
+
+      let waitMs = 0;
+      // gap mínimo entre mensajes
+      if (last) waitMs = Math.max(waitMs, minGapMs - (now - last));
+      // ventana llena → espera a que salga el más viejo
+      if (this.sentAt.length >= maxPerWindow) {
+        waitMs = Math.max(waitMs, this.sentAt[this.sentAt.length - maxPerWindow] + windowMs - now);
+      }
+      if (waitMs <= 0) return;
+
+      this.deps.onProgress({ phase: 'waiting', campaignId, total, done, sent, failed, waitMs });
+      await sleep(Math.min(waitMs, 1000)); // tick de 1s para refrescar countdown
+      if (!this.running || this.paused) return;
+    }
+  }
+
+  /** POST /jobs/claim: 'claimed' (200), 'conflict' (409) o 'error' (red/otro). */
+  private async claim(jobId: string): Promise<'claimed' | 'conflict' | 'error'> {
+    try {
+      const res = await this.deps.authFetch(`${this.deps.apiBase}/jobs/claim`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jobId }),
+      });
+      if (res.ok) return 'claimed';
+      return res.status === 409 ? 'conflict' : 'error';
+    } catch {
+      return 'error';
+    }
+  }
+
+  /**
+   * POST /jobs/ack con hasta ACK_RETRY_DELAYS_MS.length reintentos. true si el
+   * backend respondió 2xx. Si todos fallan el job queda `sending` y pasará a
+   * "por revisar" (nunca se reenvía solo).
+   */
+  private async ack(acks: { jobId: string; status: string }[]): Promise<boolean> {
+    for (let attempt = 0; attempt <= ACK_RETRY_DELAYS_MS.length; attempt++) {
+      if (attempt > 0) await sleep(ACK_RETRY_DELAYS_MS[attempt - 1]);
+      try {
+        const res = await this.deps.authFetch(`${this.deps.apiBase}/jobs/ack`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ acks }),
+        });
+        if (res.ok) return true;
+      } catch {
+        /* reintenta */
+      }
+    }
+    return false;
+  }
+
+  private async deleteFile(key: string) {
+    try {
+      await this.deps.authFetch(`${this.deps.apiBase}/uploads/delete`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ key }),
+      });
+    } catch {
+      /* no crítico */
+    }
+  }
+}
+
+/** Clave del archivo de un job (la misma que usa la UI para la plantilla por archivo). */
+export const fileKey = (j: Pick<SendJob, 'srcKey' | 'campaignId'>) => j.srcKey || j.campaignId;
+
+/** Agrupa jobs por archivo (srcKey), preservando orden de aparición. */
+function groupByFile(jobs: SendJob[]): SendJob[][] {
+  const map = new Map<string, SendJob[]>();
+  for (const j of jobs) {
+    const k = fileKey(j);
+    if (!map.has(k)) map.set(k, []);
+    map.get(k)!.push(j);
+  }
+  return [...map.values()];
+}

@@ -1,0 +1,132 @@
+import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
+import { S3Client, GetObjectCommand, DeleteObjectCommand, HeadObjectCommand, ListObjectsV2Command } from '@aws-sdk/client-s3';
+import { normalizePathSegment } from '../lib/campaign';
+import { requireAgent } from '../lib/agentAuth';
+
+const s3Client = new S3Client({});
+const BUCKET_NAME = process.env.BUCKET_NAME!;
+
+export const getChats = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+  try {
+    const agentId = normalizePathSegment(event.pathParameters?.agentId);
+    const campaignId = normalizePathSegment(event.pathParameters?.campaignId);
+
+    console.log('[getChats] start', { agentId, campaignId, bucket: BUCKET_NAME });
+
+    if (!agentId || !campaignId) {
+      console.log('[getChats] ERROR: missing params', { agentId, campaignId });
+      return {
+        statusCode: 400,
+        body: JSON.stringify({ error: 'agentId and campaignId parameters are required' }),
+      };
+    }
+
+    // Autenticación de agente antes de listar, leer o consumir (v3/agent-auth)
+    const denied = await requireAgent(event, { route: 'GET /get/chats', agent: agentId, campaign: campaignId });
+    if (denied) return denied;
+
+    const prefix = `agents/${campaignId}/`;
+    const listRes = await s3Client.send(new ListObjectsV2Command({
+      Bucket: BUCKET_NAME,
+      Prefix: prefix,
+    }));
+
+    const allKeys = (listRes.Contents || []).map((o) => o.Key);
+    console.log('[getChats] S3 list', { prefix, totalObjects: allKeys.length, keys: allKeys.slice(0, 10) });
+
+    const candidates = (listRes.Contents || [])
+      .filter((o) => !!o.Key)
+      .filter((o) => {
+        const key = o.Key as string;
+        const filename = key.split('/').pop() || '';
+
+        if (filename === 'credentials.csv') return false;
+
+        return filename.startsWith(`${agentId}-contacts`) && filename.endsWith('.csv');
+      })
+      .filter((o) => !!o.LastModified);
+
+    console.log('[getChats] candidates for agent', { agentId, candidateCount: candidates.length, candidateKeys: candidates.map((c) => c.Key) });
+
+    if (candidates.length === 0) {
+      console.log('[getChats] no candidates found, returning 404');
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ error: 'Chat assignment not found' }),
+      };
+    }
+
+    candidates.sort((a, b) => (a.LastModified as Date).getTime() - (b.LastModified as Date).getTime());
+
+    const selected = candidates[0];
+    const key = selected.Key as string;
+    console.log('[getChats] BUCKET=', BUCKET_NAME, 'KEY=', key, 'LastModified=', selected.LastModified);
+
+    const response = await s3Client.send(new GetObjectCommand({
+      Bucket: BUCKET_NAME,
+      Key: key,
+    }));
+
+    const bodyContents = await response.Body?.transformToString();
+
+    if (!bodyContents) {
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ error: 'File not found or empty' }),
+      };
+    }
+
+    const csvLines = bodyContents.trim().split('\n');
+    console.log('[getChats] CSV preview (first 5 rows):');
+    csvLines.slice(0, 5).forEach((line, idx) => console.log(`  [${idx}] ${line}`));
+    console.log('[getChats] total lines:', csvLines.length);
+
+    // Consumir el archivo: una vez leído, se elimina de S3
+    try {
+      const delRes = await s3Client.send(new DeleteObjectCommand({
+        Bucket: BUCKET_NAME,
+        Key: key,
+      }));
+      console.log('[getChats] DeleteObject OK:', JSON.stringify(delRes));
+
+      // Verificar si realmente desapareció (si no hay permisos o hay versioning raro, esto nos lo indica)
+      try {
+        await s3Client.send(new HeadObjectCommand({ Bucket: BUCKET_NAME, Key: key }));
+        console.warn('[getChats] WARNING: HeadObject todavía existe después de DeleteObject. Revisar IAM/Versioning/Key.');
+      } catch (headErr: any) {
+        console.log('[getChats] HeadObject after delete:', headErr?.name || headErr?.Code || headErr?.$metadata?.httpStatusCode);
+      }
+    } catch (deleteError: any) {
+      console.error('Error deleting chats file from S3:', deleteError);
+      return {
+        statusCode: 500,
+        body: JSON.stringify({ error: 'Failed to delete chat assignment after reading' }),
+      };
+    }
+
+    return {
+      statusCode: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        // Llave del archivo entregado (add-agent-send-history D1): el CLI la
+        // guarda para enlazar sus resultados con la publicación.
+        'X-Ana-Assignment-Key': key,
+      },
+      body: bodyContents,
+    };
+  } catch (error: any) {
+    console.error('Error getting chats:', error);
+
+    if (error.name === 'NoSuchKey') {
+      return {
+        statusCode: 404,
+        body: JSON.stringify({ error: 'Chat assignment not found' }),
+      };
+    }
+
+    return {
+      statusCode: 500,
+      body: JSON.stringify({ error: 'Internal server error' }),
+    };
+  }
+};

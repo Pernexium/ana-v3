@@ -1,0 +1,104 @@
+# ana
+
+App de envío y gestión de WhatsApp para cobranza (Pernexium). Arquitectura
+híbrida: cliente de escritorio que corre `whatsapp-web.js` local + backend
+serverless en AWS para datos y orquestación.
+
+> Diseño y decisiones completas en [ARCHITECTURE.md](./ARCHITECTURE.md).
+> Auth: [sso-cognito-cookie-storage.md](./sso-cognito-cookie-storage.md) ·
+> UI: [design-system.md](./design-system.md).
+
+## Estructura
+
+```
+backend/    Serverless (Lambda + DynamoDB + S3). API, jobs, trigger de CSV.
+desktop/    Electron + Vite + React. whatsapp-web.js + UI del operador.
+```
+
+## Por qué híbrido
+
+`whatsapp-web.js` necesita un Chromium con sesión persistente 24/7 → no corre en
+Lambda. Vive en la PC del operador (Electron). El backend serverless solo guarda
+datos (DynamoDB), recibe CSVs (S3) y reparte jobs de envío por operador; nunca
+toca WhatsApp.
+
+## Backend
+
+Serverless **v4** (compila TypeScript nativo) + `serverless-prune-plugin`.
+
+```bash
+cd backend
+npm install
+serverless login            # v4 requiere cuenta (free) o SERVERLESS_ACCESS_KEY
+cp .env.example .env        # pon ROLES_API_KEY (secreto, gitignored)
+# despliega contra el User Pool de Pernexium (región us-east-2)
+serverless deploy --stage prod \
+  --param="issuer=https://cognito-idp.us-east-2.amazonaws.com/<POOL_ID>" \
+  --param="clientId=<APP_CLIENT_ID>" \
+  --param="permissionsEnforced=false"   # enciéndelo cuando valides permisos
+```
+
+El secreto `ROLES_API_KEY` va en `backend/.env` (serverless v4 lo carga solo);
+los demás params (issuer/clientId, no secretos) en la línea de deploy.
+
+Tablas (todas aisladas por `operatorId` salvo roleperms/agents/cache):
+`conversations`, `messages`, `jobs`, `roleperms`, `agents`, `accesscache`.
+Buckets: `csv`, `media`. Endpoints en [STRUCTURE.md](./STRUCTURE.md).
+
+## Desktop
+
+```bash
+cd desktop
+npm install
+cp .env.example .env   # completa Cognito + API base
+npm run electron:dev   # Vite + Electron en caliente
+npm run dist           # instalador (electron-builder)
+```
+
+## Instalación masiva + auto-update
+
+Instalador NSIS **oneClick** (sin wizard) + `electron-updater` con feed en S3.
+
+### Bucket de updates (una vez)
+```bash
+aws s3 mb s3://ana-desktop-updates --region us-east-2 --profile pernexium
+# los clientes deben poder LEER updates/* (public-read o CloudFront):
+aws s3api put-bucket-policy --bucket ana-desktop-updates --profile pernexium --policy '{
+  "Version":"2012-10-17",
+  "Statement":[{"Effect":"Allow","Principal":"*","Action":"s3:GetObject",
+    "Resource":"arn:aws:s3:::ana-desktop-updates/updates/*"}]
+}'
+```
+
+### Publicar una versión
+```bash
+cd desktop
+# 1. sube la versión en package.json (ej 1.0.0 → 1.0.1)
+npm run publish   # build + electron-builder --win --publish always (sube .exe + latest.yml a S3)
+```
+
+### Aviso en vivo de versión nueva (una vez por bucket)
+La regla `AnaDesktopReleaseRule` (stack v4, bus por defecto de us-east-2) avisa `release.available` a las apps conectadas cuando se crea `updates/latest.yml`. El bucket no está en IaC: hay que habilitarle las notificaciones a EventBridge **una vez** (revisa antes que no tenga otras notificaciones, porque el comando reemplaza la configuración):
+```bash
+aws s3api get-bucket-notification-configuration --bucket ana-desktop-updates --profile pernexium
+aws s3api put-bucket-notification-configuration --bucket ana-desktop-updates --profile pernexium \
+  --notification-configuration '{"EventBridgeConfiguration":{}}'
+```
+Sin este paso todo funciona igual, pero las apps tardan hasta 30 min (chequeo periódico) en ver la versión.
+
+### Comportamiento en el cliente
+- **Instalación**: el `.exe` oneClick instala solo (sin "siguiente, siguiente"), crea accesos y abre la app.
+- **Update obligatorio**: al abrir, la app revisa S3. Si hay versión nueva → pantalla **bloqueante** mientras descarga; si hay un envío en curso, espera a que termine (máx 3 min, overlay "Terminando el envío en curso…") y luego reinstala y reinicia. No se puede usar hasta estar al día. Si el chequeo falla (sin red o feed caído, salvo 404 = canal sin publicar) la pantalla muestra "No se pudo verificar la actualización", **Reintentar** y reintenta sola cada 60 s; **no** hay botón para continuar sin actualizar.
+- **Acceso de emergencia (Sistemas)**: solo si el build se compiló con `ANA_UPDATE_BYPASS_HASH`. Sistemas genera el hash con `npm run hash-bypass` (`scripts/hash-bypass-password.mjs`, imprime `scrypt$<sal>$<hash>`; la contraseña nunca se guarda) y compila con `$env:ANA_UPDATE_BYPASS_HASH="scrypt$..."; npm run dist`. En la pantalla de error aparece "Acceso de emergencia (Sistemas)": pide la contraseña maestra (máx 5 intentos, luego bloqueo de 15 min), desbloquea solo hasta cerrar la app, muestra el banner "Sin actualizar — acceso de emergencia" y registra el uso en `%APPDATA%/ana/update-bypass.log`.
+- **Update a media sesión** (`add-in-session-updates`): después de la pantalla de arranque, la app revisa el feed cada 30 min, al reanudar el equipo y con `release.available` (0–30 s aleatorios). Con versión nueva muestra un aviso **no bloqueante** bajo el encabezado ("Nueva versión X — se actualizará automáticamente"; sin "Más tarde"), deja de tomar jobs (el que se está enviando termina), descarga con porcentaje, espera el job en curso (máx 3 min), muestra "Reiniciando para actualizar en N s" (60 s) e instala en silencio reabriendo la app (`quitAndInstall(true, true)`). La sesión de WhatsApp se conserva. Si la descarga falla, los jobs se reanudan y se reintenta en 30 min; un lote aprobado que se cortó se vuelve a aprobar.
+- Mass deploy: distribuye el primer `.exe` por GPO/Intune/script; las siguientes versiones llegan solas. El primer release con el update a media sesión llega por la pantalla de arranque (o el overlay anterior); desde ahí aplica el aviso no bloqueante.
+
+> Para evitar SmartScreen en Windows conviene **firmar** el `.exe` (cert code-signing). Funciona sin firmar, con advertencia la primera vez.
+
+## Flujo de envío masivo
+
+1. En **Campañas**: subes el CSV de contactos + plantilla `{columna}`.
+2. El CSV va a S3 → `csvTrigger` genera los jobs en DynamoDB (de tu operador).
+3. El proceso main pollea sus jobs, normaliza teléfonos y envía con WhatsApp.
+4. Resultados y mensajes se persisten en DynamoDB y se ven en **Chats**
+   (números enmascarados en la UI).

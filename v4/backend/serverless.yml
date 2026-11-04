@@ -1,0 +1,924 @@
+# File: serverless
+# Created: 2026-06-09
+# Updated: 2026-10-26
+# Author: Erick Hernández Silva
+
+service: ana-backend
+
+frameworkVersion: '4'
+
+# v4 compila TypeScript nativo (sin serverless-esbuild).
+plugins:
+  - serverless-prune-plugin
+
+custom:
+  # Borra versiones viejas de Lambda en cada deploy (deja las últimas 3).
+  prune:
+    automatic: true
+    number: 3
+  # Bucket de almacenamiento de v3 (us-east-1) donde vive campaign-agents/.
+  # Mismo nombre de servicio/stage que v3 (ana-backend-storage-<stage>).
+  v3BucketDefault: ana-backend-storage-${self:provider.stage}
+  v3Bucket: ${param:v3Bucket, self:custom.v3BucketDefault}
+  userPoolId: us-east-2_UepfOyKpd
+  # Canal realtime (add-realtime-gateway). Orígenes de navegador permitidos en
+  # $connect por stage; override con --param="realtimeAllowedOrigins=a,b".
+  realtimeOriginsprod: https://ana-admin.pernexium.com.mx
+  realtimeOriginsdev: https://ana-admin.pernexium.com.mx,http://localhost:3000
+  realtimeOrigins: ${param:realtimeAllowedOrigins, self:custom.realtimeOrigins${self:provider.stage}, 'https://ana-admin.pernexium.com.mx'}
+  # Endpoint de la API de administración de conexiones (URL execute-api, sin dominio propio).
+  realtimeMgmtEndpoint: !Sub 'https://${WebsocketsApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: ${opt:region, 'us-east-2'}
+  stage: ${opt:stage, 'dev'}
+  profile: pernexium
+  memorySize: 256
+  timeout: 29
+  # API WebSocket realtime (add-realtime-gateway D1/D2): una por stage.
+  websocketsApiName: ${self:service}-realtime-${self:provider.stage}
+  websocketsApiRouteSelectionExpression: $request.body.action
+  websocketsDescription: Canal realtime de ANA (avisos sin datos; add-realtime-gateway)
+  # Sin logs de stage del WebSocket: API Gateway exige un rol de CloudWatch a nivel
+  # de cuenta (configuración global que no existe en la cuenta). Las Lambdas del
+  # canal registran sus propios logs y métricas AnaRealtime/* (design D11).
+  environment:
+    STAGE: ${self:provider.stage}
+    CONVERSATIONS_TABLE: ${self:service}-conversations-${self:provider.stage}
+    MESSAGES_TABLE: ${self:service}-messages-${self:provider.stage}
+    CSV_BUCKET: ${self:service}-csv-${self:provider.stage}
+    MEDIA_BUCKET: ${self:service}-media-${self:provider.stage}
+    JOBS_TABLE: ${self:service}-jobs-${self:provider.stage}
+    # Índice por campaña que usan /jobs/summary y /jobs/reassign
+    # (v4-harden-send-job-queue D1). Deploy A: 'campaign-index'; Deploy B:
+    # --param="jobsCampaignIndex=campaign-status-index" (con el índice ACTIVE).
+    JOBS_CAMPAIGN_INDEX: ${param:jobsCampaignIndex, 'campaign-index'}
+    ROLEPERMS_TABLE: ${self:service}-roleperms-${self:provider.stage}
+    AGENTS_TABLE: ${self:service}-agents-${self:provider.stage}
+    ACCESS_CACHE_TABLE: ${self:service}-accesscache-${self:provider.stage}
+    # Historial de cargas CSV (add-contact-upload-console D7).
+    UPLOADS_TABLE: ${self:service}-uploads-${self:provider.stage}
+    # API externa de Roles & Permisos (X-Api-Key). El secreto va en backend/.env
+    # (ROLES_API_KEY=...); serverless v4 lo carga solo. NO se commitea.
+    # Es la MISMA API del dashboard (roles + users + agents). PROD = 8emg4wx2t8
+    # (DEV sería 2egq6rek0a). Si se consulta DEV, los usuarios de prod no existen.
+    ROLES_API_BASE: ${param:rolesApiBase, 'https://8emg4wx2t8.execute-api.us-east-2.amazonaws.com'}
+    ROLES_API_KEY: ${env:ROLES_API_KEY, ''}
+    # Flag de enforcement (guía §8, v4-enforce-permissions D1), parámetro
+    # `permissionsEnforced`:
+    #   'false'  (default) permite todo lo que no sea chequeo explícito.
+    #   'report' permite y registra evt:"perm_would_deny" (ruta, usuario, permiso).
+    #   'true'   aplica ROUTE_PERMISSIONS (403 "sin permiso").
+    # Ej.: npx serverless deploy --stage prod --param="permissionsEnforced=report"
+    PERMISSIONS_ENFORCED: ${param:permissionsEnforced, 'false'}
+    # API de agentes del dashboard (imery) — agentes activos por campaña.
+    DASHBOARD_BASE_PATH: ${param:dashboardBasePath, 'https://8emg4wx2t8.execute-api.us-east-2.amazonaws.com'}
+    DASHBOARD_API_KEY: ${env:DASHBOARD_API_KEY, ''}
+    # PostgreSQL — campañas. DATABASE_URL secreto en backend/.env, o los
+    # campos sueltos estilo pgAdmin (PGHOST/PGPORT/PGUSER/PGPASSWORD/PGDATABASE).
+    DATABASE_URL: ${env:DATABASE_URL, ''}
+    PGHOST: ${env:PGHOST, ''}
+    PGPORT: ${env:PGPORT, ''}
+    PGUSER: ${env:PGUSER, ''}
+    PGPASSWORD: ${env:PGPASSWORD, ''}
+    PGDATABASE: ${env:PGDATABASE, ''}
+    # API de interactions del CRM (registro de envíos). Key en backend/.env.
+    INTERACTIONS_API_BASE: ${param:interactionsApiBase, 'https://7uj0qjoby9.execute-api.us-east-2.amazonaws.com'}
+    INTERACTIONS_API_KEY: ${env:INTERACTIONS_API_KEY, ''}
+    # user_id del CRM con el que se registran las interacciones.
+    INTERACTIONS_USER_ID: ${env:INTERACTIONS_USER_ID, ''}
+    # Keys del endpoint sistema-a-sistema POST /send: SecureString en SSM
+    # (us-east-2), resueltas al desplegar. NUNCA en el repo ni en .env.
+    # send-api-key es obligatoria; send-api-key-next solo durante una rotación.
+    SEND_API_KEY: ${ssm:/ana/v4/${sls:stage}/send-api-key}
+    SEND_API_KEY_NEXT: ${ssm:/ana/v4/${sls:stage}/send-api-key-next, ''}
+    # Lista derivada de agentes (add-agent-roster-management): bucket de v3.
+    V3_BUCKET: ${self:custom.v3Bucket}
+    V3_BUCKET_REGION: ${param:v3BucketRegion, 'us-east-1'}
+    # Bucket del feed del desktop (electron-builder): su latest.yml dispara
+    # release.available (add-in-session-updates D8). No lo gestiona este stack.
+    DESKTOP_UPDATES_BUCKET: ${param:desktopUpdatesBucket, 'ana-desktop-updates'}
+    COGNITO_USER_POOL_ID: ${self:custom.userPoolId}
+    # Reparto solo a agentes habilitados. 'false' al desplegar (design D6).
+    AGENT_ROSTER_FILTER: ${param:agentRosterFilter, 'false'}
+    # Transición de llaves S3 (v4-canonical-identity-keys D6): GET /media/url
+    # acepta el segmento saneado propio. 'true' entre la migración y --delete-source.
+    MEDIA_LEGACY_OWNER: ${param:mediaLegacyOwner, 'false'}
+    # Canal realtime (add-realtime-gateway). Interruptor `realtimeEnabled`
+    # (D10): 'false' rechaza conexiones, descarta eventos y cierra las abiertas
+    # en ≤ 5 min; los clientes vuelven solos a su polling rápido.
+    REALTIME_ENABLED: ${param:realtimeEnabled, 'true'}
+    REALTIME_TABLE: ${self:service}-realtime-${self:provider.stage}
+    REALTIME_BUS: ana-realtime-${self:provider.stage}
+    REALTIME_ALLOWED_ORIGINS: ${self:custom.realtimeOrigins}
+    # App Client(s) cuyos ID tokens acepta $connect (coma).
+    REALTIME_CLIENT_IDS: ${param:realtimeClientIds, '1r6niimhkl2fmias6kk85n4ou4'}
+  httpApi:
+    cors: true
+    authorizers:
+      cognitoJwt:
+        type: jwt
+        # Pool de Pernexium. Define en deploy: --param="issuer=..." y clientId.
+        identitySource: $request.header.Authorization
+        issuerUrl: ${param:issuer, 'https://cognito-idp.us-east-2.amazonaws.com/us-east-2_UepfOyKpd'}
+        audience:
+          - ${param:clientId, '1r6niimhkl2fmias6kk85n4ou4'}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:BatchGetItem
+            - dynamodb:PutItem
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+            - dynamodb:BatchWriteItem
+          Resource:
+            - !GetAtt ConversationsTable.Arn
+            - !Sub '${ConversationsTable.Arn}/index/*'
+            - !GetAtt MessagesTable.Arn
+            - !GetAtt JobsTable.Arn
+            - !Sub '${JobsTable.Arn}/index/*'
+            - !GetAtt RolePermsTable.Arn
+            - !GetAtt AgentsTable.Arn
+            - !GetAtt AccessCacheTable.Arn
+        # Historial de cargas: csvTrigger escribe, GET /uploads/history consulta.
+        - Effect: Allow
+          Action:
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:Query
+            - dynamodb:GetItem
+          Resource:
+            - !GetAtt UploadsTable.Arn
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:DeleteObject
+          Resource:
+            - !Sub '${CsvBucket.Arn}/*'
+            - !Sub '${MediaBucket.Arn}/*'
+        # Lectores de la lista derivada (reparto, /admin/agent-roster): solo
+        # lectura. La escritura la tiene SOLO SyncCampaignAgentsRole.
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+          Resource:
+            - arn:aws:s3:::${self:custom.v3Bucket}/campaign-agents/*
+        # Realtime (add-realtime-gateway): registro de conexiones, publicación
+        # al bus y envío/cierre de conexiones WebSocket.
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:DeleteItem
+            - dynamodb:Query
+            - dynamodb:BatchWriteItem
+          Resource:
+            - !GetAtt RealtimeTable.Arn
+        - Effect: Allow
+          Action:
+            - events:PutEvents
+          Resource:
+            - !GetAtt AnaRealtimeBus.Arn
+        - Effect: Allow
+          Action:
+            - execute-api:ManageConnections
+          Resource:
+            - !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebsocketsApi}/*'
+
+package:
+  individually: true
+
+functions:
+  api:
+    handler: src/handlers/api.handler
+    description: Conversaciones / mensajes CRUD + presigned CSV upload
+    events:
+      - httpApi:
+          path: /conversations
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /conversations/{chatId}/messages
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /messages
+          method: put
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /conversations/meta
+          method: put
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /conversations/{chatId}/read
+          method: post
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /uploads/presign
+          method: post
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /uploads/delete
+          method: post
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /uploads/history
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /me
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /admin/roles
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /admin/role-permissions/{roleId}
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /admin/role-permissions/{roleId}
+          method: put
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /media/presign
+          method: post
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /media/url
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /wa-session/presign
+          method: post
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /wa-session/exists
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /wa-session/delete
+          method: post
+          authorizer: { name: cognitoJwt }
+
+  agents:
+    handler: src/handlers/agents.handler
+    description: Heartbeat + roster de agentes y campañas (vista de líder/admin)
+    events:
+      - httpApi:
+          path: /agents/heartbeat
+          method: post
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /agents
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /agents/campaigns
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /admin/agent-roster
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /admin/agent-roster
+          method: post
+          authorizer: { name: cognitoJwt }
+
+  syncCampaignAgents:
+    handler: src/handlers/syncCampaignAgents.handler
+    description: Deriva agentes por campaña (pool + API de Roles) y escribe campaign-agents/ en el bucket de v3
+    timeout: 120
+    # Rol propio: único con escritura en campaign-agents/* (no hereda el rol compartido).
+    role: SyncCampaignAgentsRole
+    events:
+      - schedule:
+          rate: rate(5 minutes)
+          enabled: true
+
+  jobsPoll:
+    handler: src/handlers/jobsPoll.handler
+    description: Entrega/ack de send-jobs por operador (DynamoDB, sin lease)
+    events:
+      - httpApi:
+          path: /jobs/poll
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /jobs/ack
+          method: post
+          authorizer: { name: cognitoJwt }
+      # Reserva antes de enviar (v4-review-interrupted-sends D1).
+      - httpApi:
+          path: /jobs/claim
+          method: post
+          authorizer: { name: cognitoJwt }
+
+  interactions:
+    handler: src/handlers/interactions.handler
+    description: Registra en el CRM el resultado de cada envío de campaña
+    events:
+      - httpApi:
+          path: /interactions/report
+          method: post
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /interactions/open
+          method: post
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /interactions/manual
+          method: post
+          authorizer: { name: cognitoJwt }
+
+  jobsAdmin:
+    handler: src/handlers/jobsAdmin.handler
+    description: Vista y reasignación de send-jobs por campaña (líder/admin)
+    events:
+      - httpApi:
+          path: /jobs/summary
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /jobs/reassign
+          method: post
+          authorizer: { name: cognitoJwt }
+      # Envíos interrumpidos por revisar (v4-review-interrupted-sends).
+      - httpApi:
+          path: /jobs/review
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /jobs/review/resolve
+          method: post
+          authorizer: { name: cognitoJwt }
+
+  directSend:
+    handler: src/handlers/directSend.handler
+    description: Encola un mensaje directo (sistema-a-sistema, X-Api-Key)
+    events:
+      - httpApi:
+          path: /send
+          method: post
+          # Sin authorizer Cognito: autentica por X-Api-Key dentro del handler.
+
+  # Configuración remota del desktop (v4-add-desktop-remote-settings): item
+  # PK=CONFIG / SK=DESKTOP_SETTINGS en RolePermsTable. Admin = rol Developer.
+  settings:
+    handler: src/handlers/settings.handler
+    description: Configuración remota del desktop v4 (lectura y edición Developer)
+    events:
+      - httpApi:
+          path: /settings
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /admin/desktop-settings
+          method: get
+          authorizer: { name: cognitoJwt }
+      - httpApi:
+          path: /admin/desktop-settings
+          method: put
+          authorizer: { name: cognitoJwt }
+
+  # --- Canal realtime (add-realtime-gateway) ---
+  # REQUEST authorizer de $connect: ID token en Sec-WebSocket-Protocol (D2).
+  realtimeAuthorizer:
+    handler: src/handlers/realtime.authorizer
+    description: Authorizer del WebSocket realtime (ID token como subprotocolo, origen, interruptor)
+    timeout: 10
+
+  realtimeConnect:
+    handler: src/handlers/realtime.connect
+    description: $connect del WebSocket realtime (temas derivados de la identidad)
+    timeout: 15
+    events:
+      - websocket:
+          route: $connect
+          authorizer:
+            name: realtimeAuthorizer
+            identitySource:
+              - route.request.header.Sec-WebSocket-Protocol
+
+  realtimeDisconnect:
+    handler: src/handlers/realtime.disconnect
+    description: $disconnect del WebSocket realtime (borra la conexión)
+    timeout: 10
+    events:
+      - websocket:
+          route: $disconnect
+
+  realtimePing:
+    handler: src/handlers/realtime.ping
+    description: Latido del WebSocket realtime (pong con exp del token)
+    timeout: 10
+    events:
+      - websocket:
+          route: ping
+
+  realtimeDefault:
+    handler: src/handlers/realtime.fallback
+    description: Acción desconocida en el WebSocket realtime (unknown_action)
+    timeout: 10
+    events:
+      - websocket:
+          route: $default
+
+  # Reparto de eventos v4, puente S3 de v3 y actualizaciones forzadas. Lo
+  # invocan las reglas AnaRealtimeV4Rule y AnaRealtimeS3Rule (resources).
+  notify:
+    handler: src/handlers/notify.handler
+    description: Reparte avisos realtime (PostToConnection) y actualizaciones forzadas
+    timeout: 30
+    environment:
+      REALTIME_MGMT_ENDPOINT: ${self:custom.realtimeMgmtEndpoint}
+
+  realtimeStats:
+    handler: src/handlers/realtimeStats.handler
+    description: ActiveConnections por tipo y cierre de conexiones con realtimeEnabled=false
+    timeout: 60
+    environment:
+      REALTIME_MGMT_ENDPOINT: ${self:custom.realtimeMgmtEndpoint}
+    events:
+      - schedule:
+          rate: rate(5 minutes)
+          enabled: true
+
+  # Actualización forzada manual (D12): solo ana:admin:console:manage o superadmin.
+  realtimeAdmin:
+    handler: src/handlers/realtimeAdmin.handler
+    description: Fuerza que las sesiones de un usuario, una campaña o todas relean su acceso
+    events:
+      - httpApi:
+          path: /admin/realtime/refresh
+          method: post
+          authorizer: { name: cognitoJwt }
+
+  csvTrigger:
+    handler: src/handlers/csvTrigger.handler
+    description: S3 ObjectCreated en csv-uploads → parsea → escribe jobs en DynamoDB
+    events:
+      - s3:
+          bucket: !Ref CsvBucket
+          event: s3:ObjectCreated:*
+          existing: true
+          rules:
+            - prefix: csv-uploads/
+            - suffix: .csv
+
+resources:
+  # Límite de tasa de POST /send en API Gateway (429 sin invocar la Lambda).
+  # HttpApiStage es el stage que genera Serverless para httpApi.
+  extensions:
+    HttpApiStage:
+      DependsOn:
+        - HttpApiRoutePostSend
+      Properties:
+        RouteSettings:
+          'POST /send':
+            ThrottlingRateLimit: 5
+            ThrottlingBurstLimit: 10
+
+  Resources:
+    # Rol exclusivo de syncCampaignAgents (design D12): ListUsers del pool,
+    # lectura del almacén rol→permisos y escritura SOLO en campaign-agents/*.
+    SyncCampaignAgentsRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: { Service: lambda.amazonaws.com }
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: sync-campaign-agents
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - cognito-idp:ListUsers
+                  Resource:
+                    - !Sub 'arn:aws:cognito-idp:us-east-2:${AWS::AccountId}:userpool/${self:custom.userPoolId}'
+                - Effect: Allow
+                  Action:
+                    - dynamodb:BatchGetItem
+                    - dynamodb:GetItem
+                  Resource:
+                    - !GetAtt RolePermsTable.Arn
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                  Resource:
+                    - arn:aws:s3:::${self:custom.v3Bucket}/campaign-agents/*
+
+    # Tres corridas fallidas seguidas (3 periodos de 5 min con Errors ≥ 1).
+    SyncCampaignAgentsFailureAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${self:provider.stage}-agent-sync-failing
+        AlarmDescription: syncCampaignAgents falló 3 veces seguidas; las listas campaign-agents/ no se actualizan (vencen a las 24 h).
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions:
+          - Name: FunctionName
+            Value: ${self:service}-${self:provider.stage}-syncCampaignAgents
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 3
+        DatapointsToAlarm: 3
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: missing
+
+    # Aislamiento multi-operador: operatorId en la PK → un operador solo
+    # puede Query su propia partición. Sin GSI, sin Scan cross-tenant.
+    ConversationsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.CONVERSATIONS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: operatorId, AttributeType: S }
+          - { AttributeName: chatId, AttributeType: S }
+          - { AttributeName: lastMessageTime, AttributeType: N }
+        KeySchema:
+          - { AttributeName: operatorId, KeyType: HASH }
+          - { AttributeName: chatId, KeyType: RANGE }
+        # Listado paginado por recientes (GET /conversations). Sparse: solo
+        # conversaciones con lastMessageTime (putConversationMeta fija 0).
+        GlobalSecondaryIndexes:
+          - IndexName: operator-recent-index
+            KeySchema:
+              - { AttributeName: operatorId, KeyType: HASH }
+              - { AttributeName: lastMessageTime, KeyType: RANGE }
+            Projection:
+              ProjectionType: ALL
+
+    MessagesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.MESSAGES_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: convKey, AttributeType: S } # `${operatorId}#${chatId}`
+          - { AttributeName: sk, AttributeType: S } # `${timestamp}#${msgId}`
+        KeySchema:
+          - { AttributeName: convKey, KeyType: HASH }
+          - { AttributeName: sk, KeyType: RANGE }
+
+    CsvBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.CSV_BUCKET}
+        # csvTrigger borra el CSV al escribir todos sus jobs; esta regla es el
+        # respaldo para escrituras parciales o eventos perdidos (D8).
+        LifecycleConfiguration:
+          Rules:
+            - Id: expire-csv-uploads
+              Status: Enabled
+              Prefix: csv-uploads/
+              ExpirationInDays: 7
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        # CORS: el navegador sube por presigned PUT (la firma es la seguridad).
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins: ['*']
+              AllowedMethods: [GET, PUT]
+              AllowedHeaders: ['*']
+              ExposedHeaders: [ETag]
+              MaxAge: 3000
+
+    MediaBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.MEDIA_BUCKET}
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins: ['*']
+              AllowedMethods: [GET, PUT]
+              AllowedHeaders: ['*']
+              ExposedHeaders: [ETag]
+              MaxAge: 3000
+
+    # Cola de send-jobs por operador. PK=operatorId aísla el pull. Sin lease:
+    # status (pending/sent/no_whatsapp/error) marca qué falta por enviar.
+    JobsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.JOBS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: operatorId, AttributeType: S }
+          - { AttributeName: jobId, AttributeType: S }
+          - { AttributeName: campaign, AttributeType: S }
+        KeySchema:
+          - { AttributeName: operatorId, KeyType: HASH }
+          - { AttributeName: jobId, KeyType: RANGE }
+        # GSI sparse por campaña (vista del líder: pendientes por agente).
+        # Solo jobs con `campaign` aparecen; los uploads sin campaña no indexan.
+        # campaign-status-index (D1) proyecta el estado real; campaign-index se
+        # retira en el Deploy C (CloudFormation crea/borra un GSI por update).
+        GlobalSecondaryIndexes:
+          - IndexName: campaign-index
+            KeySchema:
+              - { AttributeName: campaign, KeyType: HASH }
+              - { AttributeName: operatorId, KeyType: RANGE }
+            Projection:
+              ProjectionType: INCLUDE
+              NonKeyAttributes: [campaignId, leaseUntil, ttl]
+          - IndexName: campaign-status-index
+            KeySchema:
+              - { AttributeName: campaign, KeyType: HASH }
+              - { AttributeName: operatorId, KeyType: RANGE }
+            Projection:
+              ProjectionType: INCLUDE
+              NonKeyAttributes: [campaignId, srcKey, status, sentAt, ttl, label]
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    # Almacén local rol→permisos (patrón guía §5). Single-table.
+    RolePermsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.ROLEPERMS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: PK, AttributeType: S }
+          - { AttributeName: SK, AttributeType: S }
+        KeySchema:
+          - { AttributeName: PK, KeyType: HASH }
+          - { AttributeName: SK, KeyType: RANGE }
+
+    # Roster de agentes por campaña (heartbeat). Persistente: el líder/admin
+    # ven a sus agentes aunque estén offline. `lastSeen` marca actividad.
+    AgentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.AGENTS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: campaign, AttributeType: S }
+          - { AttributeName: operatorId, AttributeType: S }
+        KeySchema:
+          - { AttributeName: campaign, KeyType: HASH }
+          - { AttributeName: operatorId, KeyType: RANGE }
+
+    # Historial de cargas CSV por campaña (add-contact-upload-console D7).
+    # SK=srcKey → un evento S3 repetido reescribe el mismo registro. TTL 180 días.
+    UploadsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.UPLOADS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: campaign, AttributeType: S }
+          - { AttributeName: srcKey, AttributeType: S }
+        KeySchema:
+          - { AttributeName: campaign, KeyType: HASH }
+          - { AttributeName: srcKey, KeyType: RANGE }
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    # Caché L2 de acceso resuelto (guía §6). TTL ~15 min; PK=username.
+    AccessCacheTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.ACCESS_CACHE_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: username, AttributeType: S }
+        KeySchema:
+          - { AttributeName: username, KeyType: HASH }
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    # --- Canal realtime (add-realtime-gateway) ---
+    # Registro de conexiones (D4): PK=<tema>, SK=<connectionId> y PK=conn#<id>,
+    # SK=meta. TTL = conexión + 3 h por si $disconnect nunca llega.
+    RealtimeTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.REALTIME_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - { AttributeName: PK, AttributeType: S }
+          - { AttributeName: SK, AttributeType: S }
+        KeySchema:
+          - { AttributeName: PK, KeyType: HASH }
+          - { AttributeName: SK, KeyType: RANGE }
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    # Bus de avisos (D5). También recibe, entre regiones, los eventos S3 de v3 (D7).
+    AnaRealtimeBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:provider.environment.REALTIME_BUS}
+
+    # Eventos de los handlers v4 y peticiones de actualización forzada → notify.
+    # Un aviso de más de 60 s no vale nada: 1 reintento, sin DLQ.
+    AnaRealtimeV4Rule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${self:provider.stage}-realtime-v4
+        EventBusName: !Ref AnaRealtimeBus
+        EventPattern:
+          source:
+            - ana.v4
+        State: ENABLED
+        Targets:
+          - Id: notify
+            Arn: !GetAtt NotifyLambdaFunction.Arn
+            RetryPolicy:
+              MaximumEventAgeInSeconds: 60
+              MaximumRetryAttempts: 1
+
+    # Eventos S3 de v3 reenviados desde us-east-1 (v3/realtime-bridge) → notify.
+    AnaRealtimeS3Rule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${self:provider.stage}-realtime-v3-bridge
+        EventBusName: !Ref AnaRealtimeBus
+        EventPattern:
+          source:
+            - aws.s3
+        State: ENABLED
+        Targets:
+          - Id: notify
+            Arn: !GetAtt NotifyLambdaFunction.Arn
+            RetryPolicy:
+              MaximumEventAgeInSeconds: 60
+              MaximumRetryAttempts: 1
+
+    # Versión nueva del desktop (add-in-session-updates D8): latest.yml creado en el
+    # bucket de updates (us-east-2, bus por defecto) → notify → release.available.
+    # Requiere habilitar EventBridge en el bucket (paso manual, README).
+    AnaDesktopReleaseRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-${self:provider.stage}-desktop-release
+        Description: latest.yml del desktop publicado → release.available (add-in-session-updates)
+        EventBusName: default
+        EventPattern:
+          source:
+            - aws.s3
+          detail-type:
+            - Object Created
+          detail:
+            bucket:
+              name:
+                - ${self:provider.environment.DESKTOP_UPDATES_BUCKET}
+            object:
+              key:
+                - updates/latest.yml
+        State: ENABLED
+        Targets:
+          - Id: notify
+            Arn: !GetAtt NotifyLambdaFunction.Arn
+            RetryPolicy:
+              MaximumEventAgeInSeconds: 60
+              MaximumRetryAttempts: 1
+
+    NotifyDesktopReleaseRulePermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !GetAtt NotifyLambdaFunction.Arn
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt AnaDesktopReleaseRule.Arn
+
+    NotifyV4RulePermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !GetAtt NotifyLambdaFunction.Arn
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt AnaRealtimeV4Rule.Arn
+
+    NotifyS3RulePermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !GetAtt NotifyLambdaFunction.Arn
+        Principal: events.amazonaws.com
+        SourceArn: !GetAtt AnaRealtimeS3Rule.Arn
+
+    # Alarmas (D11). Más del 5 % de PostToConnection fallidos en 15 min.
+    RealtimePostFailingAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${self:provider.stage}-realtime-post-failing
+        AlarmDescription: Más del 5 % de los envíos realtime (PostToConnection) fallan durante 15 minutos.
+        EvaluationPeriods: 1
+        Threshold: 5
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+        Metrics:
+          - Id: failed
+            ReturnData: false
+            MetricStat:
+              Stat: Sum
+              Period: 900
+              Metric:
+                Namespace: AnaRealtime
+                MetricName: PostFailed
+                Dimensions:
+                  - { Name: Stage, Value: '${self:provider.stage}' }
+          - Id: delivered
+            ReturnData: false
+            MetricStat:
+              Stat: Sum
+              Period: 900
+              Metric:
+                Namespace: AnaRealtime
+                MetricName: PostOk
+                Dimensions:
+                  - { Name: Stage, Value: '${self:provider.stage}' }
+          - Id: gone
+            ReturnData: false
+            MetricStat:
+              Stat: Sum
+              Period: 900
+              Metric:
+                Namespace: AnaRealtime
+                MetricName: PostGone
+                Dimensions:
+                  - { Name: Stage, Value: '${self:provider.stage}' }
+          - Id: pct
+            ReturnData: true
+            Label: PostFailed %
+            Expression: 100 * FILL(failed, 0) / (FILL(failed, 0) + FILL(delivered, 0) + FILL(gone, 0))
+
+    # La Lambda de reparto falla.
+    RealtimeNotifyErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${self:provider.stage}-realtime-notify-errors
+        AlarmDescription: La Lambda notify (reparto realtime) falló.
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions:
+          - Name: FunctionName
+            Value: ${self:service}-${self:provider.stage}-notify
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 1
+        ComparisonOperator: GreaterThanOrEqualToThreshold
+        TreatMissingData: notBreaching
+
+    # Errores del authorizer > 10 en 5 min (no cuenta los Deny, solo fallos).
+    RealtimeAuthorizerErrorsAlarm:
+      Type: AWS::CloudWatch::Alarm
+      Properties:
+        AlarmName: ${self:service}-${self:provider.stage}-realtime-authorizer-errors
+        AlarmDescription: El authorizer del WebSocket realtime falló más de 10 veces en 5 minutos.
+        Namespace: AWS/Lambda
+        MetricName: Errors
+        Dimensions:
+          - Name: FunctionName
+            Value: ${self:service}-${self:provider.stage}-realtimeAuthorizer
+        Statistic: Sum
+        Period: 300
+        EvaluationPeriods: 1
+        Threshold: 10
+        ComparisonOperator: GreaterThanThreshold
+        TreatMissingData: notBreaching
+
+  Outputs:
+    # URL execute-api por defecto (sin dominio propio): valor de configuración
+    # de los clientes (ANA_REALTIME_URL, NEXT_PUBLIC_REALTIME_URL).
+    RealtimeWsUrl:
+      Description: URL del WebSocket realtime
+      Value: !Sub 'wss://${WebsocketsApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}'
+    # Destino de la regla de reenvío de v3 (--param="realtimeBusArn=...").
+    RealtimeBusArn:
+      Description: ARN del bus realtime (destino del puente de v3)
+      Value: !GetAtt AnaRealtimeBus.Arn

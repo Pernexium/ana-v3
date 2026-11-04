@@ -1,0 +1,47 @@
+import fs from 'fs';
+import path from 'path';
+import { realtimeConfigFrom } from './realtime.js';
+
+const resolveBaseDir = () => {
+  if (process.env.ANA_DATA_DIR) return process.env.ANA_DATA_DIR;
+
+  const appData = process.env.APPDATA;
+  if (appData) return path.join(appData, 'ANA');
+
+  const localAppData = process.env.LOCALAPPDATA;
+  if (localAppData) return path.join(localAppData, 'ANA');
+
+  return process.cwd();
+};
+
+const baseDir = resolveBaseDir();
+try {
+  fs.mkdirSync(baseDir, { recursive: true });
+} catch (e) {
+  // ignore
+}
+
+export const CONFIG = {
+  apiBaseUrl: 'https://ow24p7ablb.execute-api.us-east-1.amazonaws.com', // URL del backend
+  inputCsv: path.join(baseDir, 'contactos.csv'),
+  outputCsv: path.join(baseDir, 'resultados.csv'),
+  responsesCsv: path.join(baseDir, 'respuestas.csv'),
+  sessionPath: path.join(baseDir, 'whatsapp-session'),
+  manualSessionPath: path.join(baseDir, 'whatsapp-session-manual'), // Sesión para ventana manual
+  monitorSessionPath: path.join(baseDir, 'whatsapp-session-monitor'),
+  delayBetweenMessages: 5000, // 5 segundos entre mensajes
+  waitForResponse: 0, // 0 segundos = no esperar respuesta, ir directo al siguiente
+  useClipboardMedia: false, // Si es true, intentará pegar media desde el portapapeles antes del texto
+  showOverlay: true, // Si es true, muestra un overlay para evitar interacción del usuario
+  enableManualWindow: true, // Si es true, abre ventana para respuestas manuales
+  enableMonitorWindow: true, // Cambiar a false para desactivar la ventana monitor
+  // Canal realtime (add-realtime-v3-cli): URL execute-api `RealtimeWsUrl` del stack
+  // v4 (sin dominio propio). Vacío = sin canal (polls cada 30 s como antes); se
+  // fija en el release. ANA_REALTIME_URL la reemplaza; ANA_REALTIME=off la apaga.
+  realtimeUrl: 'wss://c1azskji9l.execute-api.us-east-2.amazonaws.com/prod',
+};
+
+/** `{ enabled, url, reason? }` del canal realtime para este proceso. */
+export const realtimeConfig = (env = process.env) => realtimeConfigFrom(env, CONFIG.realtimeUrl);
+
+export const __dirname_export = baseDir;

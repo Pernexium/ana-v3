@@ -1,0 +1,460 @@
+// File: Envoltura de whatsapp-web.js. Vive en el main process de Electron.
+// Created: 2026-06-09
+// Updated: 2026-10-26
+// Author: Erick Hernández Silva
+
+import { Client, RemoteAuth, MessageMedia, type Message } from 'whatsapp-web.js';
+import QRCode from 'qrcode';
+import { EventEmitter } from 'node:events';
+import { app } from 'electron';
+import fs from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { S3SessionStore } from './s3Store';
+import type { AuthFetch } from '../auth/tokenBroker';
+
+// Sesión en una ruta estable de la app (no en cwd) → clearable y consistente
+// entre dev y empaquetado.
+const AUTH_DIR = path.join(app.getPath('userData'), 'wwebjs_auth');
+// Respaldo de la sesión a S3 cada 2 min → restaurable en otra máquina del
+// mismo agente sin reescanear el QR.
+const BACKUP_SYNC_MS = 2 * 60 * 1000;
+import { normalizeDigits, toJid } from './phone';
+import type { ResolveResult } from '../jobs/outcome';
+
+export type WaState = 'idle' | 'qr' | 'authenticated' | 'connected' | 'disconnected';
+
+export interface WaEvents {
+  qr: (dataUrl: string) => void;
+  status: (s: 'authenticated' | 'connected' | 'disconnected' | 'auth_failure') => void;
+  message: (msg: NormalizedMessage) => void;
+  error: (e: string) => void;
+  conflict: (msg: string) => void; // sesión abierta en otro equipo
+  loading: (msg: string) => void; // progreso del arranque (sesión remota, etc.)
+}
+
+export interface NormalizedMessage {
+  id: string;
+  chatId: string;
+  from: string;
+  to: string;
+  body: string;
+  timestamp: number; // ms
+  fromMe: boolean;
+  type: string;
+  // backup de media en S3 (se rellena en main tras subir)
+  mediaKey?: string;
+  mimetype?: string;
+  filename?: string;
+  // transitorio: bytes de media descargados, NO se persisten (main los sube y borra)
+  _media?: { dataBase64: string; mimetype: string; filename?: string };
+}
+
+/**
+ * Envoltura de whatsapp-web.js. Vive en el main process de Electron.
+ * Emite eventos tipados; main.ts los reenvía al renderer por IPC y al backend.
+ */
+export class WaClient extends EventEmitter {
+  private client: Client | null = null;
+  private starting = false;
+  private sawSignal = false; // hubo qr/ready/loading → no está colgado
+  private lastState: WaState = 'idle';
+  private lastQr: string | null = null;
+  // Respaldo remoto de sesión (RemoteAuth + S3). Se configura tras el login.
+  private apiBase = '';
+  private hasSession: () => boolean = () => false;
+  private authFetch: AuthFetch = async () => {
+    throw new Error('WhatsApp sin configurar (falta login)');
+  };
+  private operatorId = 'ana';
+
+  /** Inyecta el backend + sesión + operador (tras login) para el respaldo S3. */
+  configure(
+    apiBase: string,
+    auth: { hasSession: () => boolean; authFetch: AuthFetch },
+    operatorId: string,
+  ) {
+    this.apiBase = apiBase;
+    this.hasSession = auth.hasSession;
+    this.authFetch = auth.authFetch;
+    // clientId de RemoteAuth solo acepta [-_\w]; el aislamiento real lo da el
+    // JWT en el backend (key por usuario), esto es solo el nombre local.
+    this.operatorId = (operatorId || 'ana').replace(/[^\w-]/g, '_');
+  }
+
+  isReady() {
+    return !!this.client;
+  }
+
+  /** Estado actual para que el renderer lo recupere tras refresh. */
+  getState(): { status: WaState; qr: string | null } {
+    return { status: this.lastState, qr: this.lastQr };
+  }
+
+  /**
+   * Estado real de whatsapp-web.js (`client.getState()`), acotado: `absent` sin
+   * cliente, `timeout` si Chromium no responde (p. ej. tras suspender el equipo).
+   */
+  async probe(timeoutMs: number): Promise<string> {
+    const c = this.client;
+    if (!c) return 'absent';
+    if (this.starting) return 'CONNECTED'; // arrancando: no interferir
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const st = await Promise.race([
+        c.getState().then((s) => String(s ?? 'null')),
+        new Promise<string>((resolve) => {
+          timer = setTimeout(() => resolve('timeout'), timeoutMs);
+        }),
+      ]);
+      return st;
+    } catch {
+      return 'error';
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Reinicializa el cliente CONSERVANDO la sesión guardada (mismo camino que
+   * tras una desconexión: `reset()` + `start()`, sin borrar el perfil ni S3).
+   */
+  async restartKeepSession() {
+    console.log('[wa] reinicializando tras reanudar (sesión conservada)');
+    await this.reset();
+    this.lastState = 'idle';
+    await this.start(); // emite `loading` y luego `connected` al restaurar
+  }
+
+  /** ¿Hay sesión local guardada? (RemoteAuth deja la carpeta del perfil). */
+  hasSavedSession(): boolean {
+    return existsSync(path.join(AUTH_DIR, `RemoteAuth-${this.operatorId}`));
+  }
+
+  async start() {
+    if (this.client || this.starting) return;
+    if (!this.hasSession()) {
+      // Sin token aún no se puede restaurar/respaldar la sesión en S3.
+      this.emit('error', 'Inicia sesión antes de conectar WhatsApp.');
+      return;
+    }
+    this.starting = true;
+    this.sawSignal = false;
+    console.log('[wa] start: lanzando cliente…');
+    this.emit('loading', 'Iniciando WhatsApp…');
+    try {
+      const store = new S3SessionStore(this.apiBase, this.authFetch, AUTH_DIR, (msg) =>
+        this.emit('loading', msg),
+      );
+      // En el build instalado, Chromium va bundleado en resources/chrome (en dev
+      // puppeteer usa el de su caché). Sin esto el exe no encuentra Chrome.
+      const executablePath = app.isPackaged
+        ? path.join(process.resourcesPath, 'chrome', 'chrome.exe')
+        : undefined;
+      this.client = new Client({
+        authStrategy: new RemoteAuth({
+          clientId: this.operatorId,
+          dataPath: AUTH_DIR,
+          store,
+          backupSyncIntervalMs: BACKUP_SYNC_MS,
+        }),
+        puppeteer: {
+          headless: true,
+          ...(executablePath ? { executablePath } : {}),
+          // Sandbox de Chromium ACTIVO (sin --no-sandbox ni --disable-setuid-sandbox).
+          args: ['--disable-dev-shm-usage', '--disable-gpu'],
+        },
+      });
+      this.wire();
+
+      // Watchdog: si en 60s no hubo QR/ready/loading, algo se colgó → avisa.
+      const watchdog = setTimeout(() => {
+        if (!this.sawSignal) {
+          console.error('[wa] watchdog: sin señal en 60s (posible Chromium/red).');
+          this.emit('error', 'No respondió WhatsApp Web (tarda o falló el navegador). Reintenta.');
+        }
+      }, 60_000);
+
+      await this.client.initialize();
+      clearTimeout(watchdog);
+      console.log('[wa] initialize() resolvió.');
+    } catch (e: any) {
+      console.error('[wa] initialize() falló:', e);
+      this.client = null;
+      this.emit('error', e?.message ?? String(e));
+    } finally {
+      this.starting = false;
+    }
+  }
+
+  async stop() {
+    if (!this.client) return;
+    try {
+      await this.client.destroy();
+    } finally {
+      this.client = null;
+    }
+  }
+
+  /**
+   * Logout de la app (cambio de usuario): detiene WhatsApp y BORRA la sesión
+   * LOCAL — pero conserva el respaldo en S3 para que cada usuario la restaure.
+   * Evita que el siguiente usuario se conecte al WhatsApp del anterior.
+   */
+  async logoutLocal() {
+    await this.reset();
+    this.operatorId = 'ana'; // olvida el operador anterior
+    try {
+      await fs.rm(AUTH_DIR, { recursive: true, force: true });
+      console.log('[wa] sesión local borrada (logout)');
+    } catch (e) {
+      console.error('[wa] no se pudo borrar sesión local:', e);
+    }
+  }
+
+  /** Libera el cliente y BORRA la sesión local + el respaldo en S3 (logout). */
+  async clearSession() {
+    await this.reset();
+    // Borra el respaldo remoto para que no se restaure una sesión muerta.
+    try {
+      const store = new S3SessionStore(this.apiBase, this.authFetch, AUTH_DIR);
+      await store.delete({ session: `RemoteAuth-${this.operatorId}` });
+    } catch (e) {
+      console.error('[wa] no se pudo borrar la sesión remota:', e);
+    }
+    try {
+      await fs.rm(AUTH_DIR, { recursive: true, force: true });
+      console.log('[wa] sesión borrada:', AUTH_DIR);
+    } catch (e) {
+      console.error('[wa] no se pudo borrar sesión:', e);
+    }
+  }
+
+  /** Libera el cliente sin propagar errores; deja listo para volver a start(). */
+  private async reset() {
+    const c = this.client;
+    this.client = null;
+    this.starting = false;
+    try {
+      await c?.destroy();
+    } catch {
+      // ignora: el cliente pudo morir solo
+    }
+  }
+
+  private wire() {
+    const c = this.client!;
+    c.on('loading_screen', (percent) => {
+      this.sawSignal = true;
+      console.log('[wa] loading_screen', percent);
+      this.emit('loading', `Cargando conversaciones… ${percent || 0}%`);
+    });
+    c.on('authenticated', () => this.emit('loading', 'Autenticando…'));
+    c.on('change_state', (s) => console.log('[wa] change_state', s));
+    c.on('qr', async (qr) => {
+      this.sawSignal = true;
+      this.lastState = 'qr';
+      console.log('[wa] qr recibido');
+      try {
+        const dataUrl = await QRCode.toDataURL(qr, { errorCorrectionLevel: 'M' });
+        this.lastQr = dataUrl;
+        this.emit('qr', dataUrl);
+      } catch (e: any) {
+        this.emit('error', String(e));
+      }
+    });
+    c.on('authenticated', () => {
+      this.sawSignal = true;
+      this.lastState = 'authenticated';
+      this.emit('status', 'authenticated');
+    });
+    c.on('auth_failure', () => {
+      this.lastState = 'disconnected';
+      this.lastQr = null;
+      this.emit('status', 'auth_failure');
+      this.emit(
+        'error',
+        'WhatsApp rechazó la sesión (posible cierre remoto o bloqueo del número). ' +
+          'Usa "Limpiar sesión y reconectar" para reescanear el QR; tus ' +
+          'conversaciones respaldadas se recargan solas.',
+      );
+      void this.reset(); // sesión inválida → liberar para reintentar con QR
+    });
+    c.on('ready', () => {
+      this.sawSignal = true;
+      this.lastState = 'connected';
+      this.lastQr = null;
+      this.emit('status', 'connected');
+    });
+    c.on('disconnected', (reason) => {
+      this.lastState = 'disconnected';
+      this.lastQr = null;
+      this.emit('status', 'disconnected');
+      const r = String(reason).toUpperCase();
+      // CONFLICT = la sesión se abrió en OTRO dispositivo/máquina y desplazó a
+      // esta. LOGOUT = cierre desde el teléfono o número bloqueado.
+      const conflict = r.includes('CONFLICT');
+      const blocked = r.includes('LOGOUT');
+      if (conflict) {
+        this.emit(
+          'conflict',
+          'Tu sesión de WhatsApp se abrió en otra computadora y se cerró aquí. ' +
+            'Solo puede estar activa en un equipo a la vez. Vuelve a conectar para retomarla aquí.',
+        );
+      }
+      this.emit(
+        'error',
+        conflict
+          ? 'Sesión abierta en otro equipo: WhatsApp se cerró en esta computadora.'
+          : blocked
+            ? 'WhatsApp cerró la sesión (cierre desde el teléfono o bloqueo del número). ' +
+              'Limpia la sesión y reescanea el QR; tus conversaciones respaldadas se recargan solas.'
+            : `WhatsApp se desconectó (${String(reason)}). Reintenta conectar; si persiste, limpia la sesión y reescanea.`,
+      );
+      // Libera el cliente para poder reconectar (cerró sesión / cayó la red).
+      void this.reset();
+    });
+    // Entrantes.
+    c.on('message', (m) => void this.forward(m));
+    // Propios creados en CUALQUIER dispositivo (teléfono, otro WhatsApp Web):
+    // se respaldan igual que los entrantes. Los que envió esta app ya se
+    // persistieron (mismo id → el PUT condicional del backend los ignora); se
+    // saltan si ya se conoce el id para no re-subir su media.
+    c.on('message_create', (m) => {
+      if (!m.fromMe) return; // los entrantes llegan por 'message'
+      if (this.sentByApp.has(m.id._serialized)) return;
+      void this.forward(m);
+    });
+  }
+
+  /** Ids enviados por la app (recientes), para no duplicar su respaldo. */
+  private sentByApp = new Set<string>();
+  private rememberSent(id: string) {
+    this.sentByApp.add(id);
+    if (this.sentByApp.size > 500) {
+      const first = this.sentByApp.values().next().value;
+      if (first !== undefined) this.sentByApp.delete(first);
+    }
+  }
+
+  /** Normaliza (y baja la media) y emite 'message' para respaldo + UI. */
+  private async forward(m: Message) {
+    const norm = this.normalize(m);
+    if (m.hasMedia) {
+      try {
+        const media = await m.downloadMedia();
+        if (media) {
+          norm._media = {
+            dataBase64: media.data,
+            mimetype: media.mimetype,
+            filename: media.filename ?? undefined,
+          };
+          norm.mimetype = media.mimetype;
+        }
+      } catch (e) {
+        this.emit('error', `downloadMedia: ${String(e)}`);
+      }
+    }
+    this.emit('message', norm);
+  }
+
+  private normalize(m: Message): NormalizedMessage {
+    return {
+      id: m.id._serialized,
+      // Conversación = SIEMPRE la otra parte. En salientes m.from es tu propio
+      // número; usar m.to evita un chat fantasma con tu propia línea (***1922).
+      chatId: m.fromMe ? m.to : m.from,
+      from: m.from,
+      to: m.to,
+      body: m.body ?? '',
+      timestamp: m.timestamp * 1000,
+      fromMe: m.fromMe,
+      type: m.type,
+    };
+  }
+
+  /**
+   * Resuelve el JID real (WhatsApp decide el `1` de MX). Distingue un teléfono
+   * que no se puede normalizar (`invalid`, sin consultar WhatsApp) de un número
+   * que WhatsApp no reconoce (`not_on_whatsapp`).
+   */
+  async resolveJid(rawPhone: string, countryCode: string): Promise<ResolveResult> {
+    if (!this.client) throw new Error('WhatsApp no conectado');
+    const digits = normalizeDigits(rawPhone, countryCode);
+    if (!digits) return { kind: 'invalid' };
+    const numberId = await this.client.getNumberId(digits);
+    return numberId ? { kind: 'ok', jid: numberId._serialized } : { kind: 'not_on_whatsapp' };
+  }
+
+  /** Muestra/oculta "escribiendo…" en un chat (typing en vivo del chat manual). */
+  async setTyping(jid: string, on: boolean): Promise<void> {
+    if (!this.client) {
+      console.warn('[wa] setTyping: sin cliente');
+      return;
+    }
+    try {
+      const chat = await this.client.getChatById(jid);
+      if (on) await chat.sendStateTyping();
+      else await chat.clearState();
+      console.log('[wa] setTyping', on ? 'ON' : 'off', jid);
+    } catch (e) {
+      console.error('[wa] setTyping falló', jid, e);
+    }
+  }
+
+  async sendText(jid: string, body: string, simulateTyping = true): Promise<NormalizedMessage> {
+    if (!this.client) throw new Error('WhatsApp no conectado');
+    // Envío automático (campañas): simula escritura proporcional al largo (2–9s).
+    // En respuestas manuales el typing ya se mostró en vivo → simulateTyping=false.
+    if (simulateTyping) {
+      const typeMs = Math.min(9000, Math.max(2000, body.length * 70));
+      try {
+        const chat = await this.client.getChatById(jid);
+        await chat.sendStateTyping();
+        await new Promise((r) => setTimeout(r, typeMs));
+        await chat.clearState();
+      } catch {
+        await new Promise((r) => setTimeout(r, typeMs));
+      }
+    }
+    const sent = await this.client.sendMessage(jid, body);
+    this.rememberSent(sent.id._serialized);
+    return {
+      id: sent.id._serialized,
+      chatId: jid,
+      from: 'me',
+      to: jid,
+      body,
+      // Mismo timestamp que verá message_create → misma sk en el respaldo (una sola copia).
+      timestamp: sent.timestamp ? sent.timestamp * 1000 : Date.now(),
+      fromMe: true,
+      type: 'chat',
+    };
+  }
+
+  /** Envía media (imagen/archivo) desde bytes base64. Devuelve el mensaje. */
+  async sendMediaData(
+    jid: string,
+    m: { dataBase64: string; mimetype: string; filename: string; caption?: string },
+  ): Promise<NormalizedMessage> {
+    if (!this.client) throw new Error('WhatsApp no conectado');
+    const media = new MessageMedia(m.mimetype, m.dataBase64, m.filename);
+    const sent = await this.client.sendMessage(jid, media, { caption: m.caption });
+    this.rememberSent(sent.id._serialized);
+    return {
+      id: sent.id._serialized,
+      chatId: jid,
+      from: 'me',
+      to: jid,
+      body: m.caption ?? '',
+      // Mismo timestamp que verá message_create → misma sk en el respaldo (una sola copia).
+      timestamp: sent.timestamp ? sent.timestamp * 1000 : Date.now(),
+      fromMe: true,
+      type: m.mimetype.startsWith('image/') ? 'image' : 'document',
+      mimetype: m.mimetype,
+      filename: m.filename,
+    };
+  }
+}
+
+export { toJid };

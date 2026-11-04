@@ -1,0 +1,847 @@
+# "org" ensures this Service is used with the correct Serverless Framework Access Key.
+org: pernexium
+# "service" is the name of this project. This will also be added to your AWS resource names.
+service: ana-backend
+params:
+  dev:
+    domain: ana-dev.pernexium.com.mx
+  prod:
+    domain: ana-prod.pernexium.com.mx
+
+build:
+  esbuild: true
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  profile: pernexium
+  domain: ${param:domain}
+  # Uncomment to easily set up a custom domain. Read the docs for more details:
+  # https://www.serverless.com/framework/docs/providers/aws/guide/domains
+  # domain: api.example.com
+  httpApi:
+    # CORS solo para dominios de Pernexium (el CLI es Node y no envía Origin).
+    # API Gateway responde el preflight; los handlers ya no ponen cabeceras CORS.
+    cors:
+      allowedOrigins:
+        # HTTP API no acepta comodines de subdominio: orígenes explícitos.
+        # ANA Admin llama desde su servidor (BFF) y el CLI no envía Origin.
+        - https://pernexium.com.mx
+        - https://pernexium.com
+        - https://ana-admin.pernexium.com.mx
+      allowedHeaders:
+        - Content-Type
+        - Authorization
+        - X-Admin-Key
+      allowedMethods:
+        - GET
+        - POST
+        - OPTIONS
+      maxAge: 3600
+    authorizers:
+      # Rutas /admin/* (ANA Admin): id token del pool compartido de Pernexium
+      # emitido para el App Client de ANA Admin/v4 (add-agent-roster-management D3).
+      # X-Admin-Key NO sustituye al token en estas rutas.
+      cognitoAdminJwt:
+        type: jwt
+        identitySource: $request.header.Authorization
+        issuerUrl: https://cognito-idp.us-east-2.amazonaws.com/us-east-2_UepfOyKpd
+        audience:
+          - ${env:COGNITO_ADMIN_CLIENT_IDS, '1r6niimhkl2fmias6kk85n4ou4'}
+      # Rutas de agente del CLI v3 (migrate-cli-to-cognito-login D4): id token del
+      # mismo pool emitido para el App Client público `ana-v3-cli`. Adjunto desde el
+      # inicio a /agent/*; al resto de rutas de agente solo al activar el modo
+      # estricto (tarea 7.5). La audiencia admite UN client id por elemento: si
+      # COGNITO_AGENT_CLIENT_IDS llega a tener varios, agregar un elemento por id.
+      # Sin configurar, la audiencia placeholder rechaza todo (fail-closed).
+      cognitoAgentJwt:
+        type: jwt
+        identitySource: $request.header.Authorization
+        issuerUrl: https://cognito-idp.us-east-2.amazonaws.com/${env:COGNITO_USER_POOL_ID, 'us-east-2_UepfOyKpd'}
+        audience:
+          - ${env:COGNITO_AGENT_CLIENT_IDS, '1r6niimhkl2fmias6kk85n4ou4'}
+  environment:
+    BUCKET_NAME: ${self:service}-storage-${sls:stage}
+    # Llave de administración (supervisores). Va en .env, NO se commitea.
+    ADMIN_API_KEY: ${env:ADMIN_API_KEY, ''}
+    # 'true' exige X-Admin-Key en rutas de supervisor; por ahora apagado (motor-de-gestion no la envía).
+    ADMIN_AUTH_ENFORCED: ${env:ADMIN_AUTH_ENFORCED, 'false'}
+    ANA_API_URL: https://ow24p7ablb.execute-api.us-east-1.amazonaws.com
+    TEMPLATES_BUCKET: s3-motor-509399624341-prod
+    # Autorización de /admin/*: acceso ANA vía v4 GET /me (design D4).
+    ANA_V4_API_BASE: ${env:ANA_V4_API_BASE, 'https://njpfef2qna.execute-api.us-east-2.amazonaws.com'}
+    # Autenticación de agente del CLI (migrate-cli-to-cognito-login D6).
+    # 'false' = modo reporte (registra y atiende); 'true' = estricto (401/403/503).
+    AGENT_AUTH_ENFORCED: ${env:AGENT_AUTH_ENFORCED, 'false'}
+    COGNITO_USER_POOL_ID: ${env:COGNITO_USER_POOL_ID, 'us-east-2_UepfOyKpd'}
+    # App Client(s) del CLI aceptados, separados por coma (id de `ana-v3-cli`).
+    COGNITO_AGENT_CLIENT_IDS: ${env:COGNITO_AGENT_CLIENT_IDS, '1r6niimhkl2fmias6kk85n4ou4'}
+    # API de Roles: user_id/nombre CRM del agente en GET /agent/campaigns
+    # (crm-interactions-agent-identity). La key va en .env, NO se commitea.
+    ROLES_API_BASE: ${env:ROLES_API_BASE, 'https://8emg4wx2t8.execute-api.us-east-2.amazonaws.com'}
+    ROLES_API_KEY: ${env:ROLES_API_KEY, ''}
+    # Registro de estado de WhatsApp por teléfono (add-whatsapp-status-registry D1).
+    WA_STATUS_TABLE: ${self:service}-wa-status-${sls:stage}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:ListBucket
+            - s3:DeleteObject
+          Resource:
+            - arn:aws:s3:::${self:service}-storage-${sls:stage}/*
+            - arn:aws:s3:::${self:service}-storage-${sls:stage}
+            - arn:aws:s3:::s3-motor-509399624341-prod
+            - arn:aws:s3:::s3-motor-509399624341-prod/templates/*
+        # Registro de WhatsApp (add-whatsapp-status-registry D1): solo acceso por llave.
+        - Effect: Allow
+          Action:
+            - dynamodb:GetItem
+            - dynamodb:UpdateItem
+            - dynamodb:BatchGetItem
+          Resource:
+            - Fn::GetAtt: [WaStatusTable, Arn]
+
+functions:
+  hello:
+    handler: handler.hello
+    events:
+      - httpApi:
+          path: /
+          method: get
+
+  uploadBackup:
+    handler: src/handlers/backups.uploadBackup
+    events:
+      - httpApi:
+          path: /backups
+          method: post
+
+  getLatestBackup:
+    handler: src/handlers/backups.getLatestBackup
+    events:
+      - httpApi:
+          path: /backups/latest/{agentId}/{campaign}
+          method: get
+
+  saveChatBackup:
+    handler: src/handlers/chatBackups.saveChatBackup
+    events:
+      - httpApi:
+          path: /backups/chat
+          method: post
+
+  getChatBackup:
+    handler: src/handlers/chatBackups.getChatBackup
+    events:
+      - httpApi:
+          path: /backups/chat/{campaign}/{agentId}/{contactPhone}
+          method: get
+
+  listChatBackups:
+    handler: src/handlers/chatBackups.listChatBackups
+    events:
+      - httpApi:
+          path: /backups/chats/{campaign}/{agentId}
+          method: get
+
+  getChats:
+    handler: src/handlers/chats.getChats
+    events:
+      - httpApi:
+          path: /get/chats/{agentId}/{campaignId}
+          method: get
+
+  uploadMedia:
+    handler: src/handlers/media.uploadMedia
+    events:
+      - httpApi:
+          path: /media
+          method: post
+
+  updatePendingContacts:
+    handler: src/handlers/contacts.updatePendingContacts
+    events:
+      - httpApi:
+          path: /contacts/pending
+          method: post
+
+  verifyCredentials:
+    handler: src/handlers/auth.verifyCredentials
+    events:
+      - httpApi:
+          path: /auth/verify
+          method: post
+
+  # Supervisores - Cargar datos de agentes
+  uploadAgentContacts:
+    handler: src/handlers/supervisors.uploadAgentContacts
+    events:
+      - httpApi:
+          path: /supervisors/agents/{agent}/{campaign}/contacts
+          method: post
+
+  getAgentContacts:
+    handler: src/handlers/supervisors.getAgentContacts
+    events:
+      - httpApi:
+          path: /supervisors/agents/{agent}/{campaign}/contacts
+          method: get
+
+  # Supervisores - Consultar asignaciones (assignments)
+  listAgentAssignments:
+    handler: src/handlers/supervisors.listAgentAssignments
+    events:
+      - httpApi:
+          path: /supervisors/assignments/agents/{agent}/{campaign}
+          method: get
+
+  getAgentAssignments:
+    handler: src/handlers/supervisors.getAgentAssignments
+    events:
+      - httpApi:
+          path: /supervisors/assignments/agents/{agent}/{campaign}/contacts
+          method: get
+
+  # Supervisores - Contactos por revisar (envío interrumpido por cierre del CLI)
+  listReviewContacts:
+    handler: src/handlers/supervisors.listReviewContacts
+    events:
+      - httpApi:
+          path: /supervisors/review/{campaign}
+          method: get
+
+  # Agentes - Publicar selección final hacia key legacy/deprecated
+  publishAgentContactsDeprecated:
+    handler: src/handlers/supervisors.publishAgentContactsDeprecated
+    events:
+      - httpApi:
+          path: /agents/{agent}/{campaign}/contacts
+          method: post
+
+  # Supervisores - Descargar archivo(s) por S3 key(s)
+  downloadFilesByKey:
+    handler: src/handlers/supervisors.downloadFilesByKey
+    events:
+      - httpApi:
+          path: /supervisors/files/download
+          method: post
+
+  # Credenciales por campaña
+  getCampaignCredentials:
+    handler: src/handlers/credentials.getCampaignCredentials
+    events:
+      - httpApi:
+          path: /credentials/{campaign}
+          method: get
+
+  uploadCampaignCredentials:
+    handler: src/handlers/credentials.uploadCampaignCredentials
+    events:
+      - httpApi:
+          path: /credentials/upload
+          method: post
+
+  regenerateDailyPasswords:
+    handler: src/handlers/credentials.regenerateDailyPasswords
+    events:
+      - httpApi:
+          path: /credentials/regenerate
+          method: post
+
+  # Templates de campaña (S3: s3-motor-509399624341-prod)
+  getTemplates:
+    handler: src/handlers/templates.getTemplates
+    events:
+      - httpApi:
+          path: /templates
+          method: get
+
+  putTemplate:
+    handler: src/handlers/templates.putTemplate
+    events:
+      - httpApi:
+          path: /templates
+          method: post
+
+  # ANA Admin (/admin/*, authorizer cognitoAdminJwt) — add-agent-roster-management
+  adminGetRoster:
+    handler: src/handlers/adminRoster.getRoster
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/roster
+          method: get
+          authorizer:
+            name: cognitoAdminJwt
+
+  adminUpdateRosterAgents:
+    handler: src/handlers/adminRoster.updateRosterAgents
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/roster/agents
+          method: post
+          authorizer:
+            name: cognitoAdminJwt
+
+  # add-contact-upload-console
+  # support-crm-base-upload: las cargas grandes (hasta 50 MB / 200 000 filas)
+  # se leen de S3 y se reparten en memoria. HTTP API corta a 30 s, así que el
+  # timeout se queda en 29 s y se sube la memoria (más CPU).
+  adminUploadContacts:
+    handler: src/handlers/adminContacts.uploadContacts
+    timeout: 29
+    memorySize: 1024
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/contacts
+          method: post
+          authorizer:
+            name: cognitoAdminJwt
+
+  # URL firmada (PUT, 15 min) para subir el CSV maestro a uploads-incoming/.
+  adminPresignContacts:
+    handler: src/handlers/adminContacts.presignContacts
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/contacts/presign
+          method: post
+          authorizer:
+            name: cognitoAdminJwt
+
+  adminListUploads:
+    handler: src/handlers/adminContacts.listUploads
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/uploads
+          method: get
+          authorizer:
+            name: cognitoAdminJwt
+
+  # Rutas /agent/* del CLI (siempre estrictas, authorizer cognitoAgentJwt) —
+  # migrate-cli-to-cognito-login y add-cli-remote-settings.
+  agentCampaigns:
+    handler: src/handlers/agent.getAgentCampaigns
+    events:
+      - httpApi:
+          path: /agent/campaigns
+          method: get
+          authorizer:
+            name: cognitoAgentJwt
+
+  agentSettings:
+    handler: src/handlers/agent.getAgentSettings
+    events:
+      - httpApi:
+          path: /agent/settings
+          method: get
+          authorizer:
+            name: cognitoAgentJwt
+
+  # add-agent-workspace: "Mi asignación" de ANA Admin (mismo token/App Client que el CLI)
+  agentListAssignments:
+    handler: src/handlers/agentAssignments.listAssignments
+    events:
+      - httpApi:
+          path: /agent/assignments/{campaign}
+          method: get
+          authorizer:
+            name: cognitoAgentJwt
+
+  agentGetAssignmentFile:
+    handler: src/handlers/agentAssignments.getAssignmentFile
+    events:
+      - httpApi:
+          path: /agent/assignments/{campaign}/file
+          method: get
+          authorizer:
+            name: cognitoAgentJwt
+
+  agentPublishAssignments:
+    handler: src/handlers/agentAssignments.publishAssignments
+    timeout: 29
+    events:
+      - httpApi:
+          path: /agent/assignments/{campaign}/publish
+          method: post
+          authorizer:
+            name: cognitoAgentJwt
+
+  agentListPublications:
+    handler: src/handlers/agentAssignments.listPublications
+    events:
+      - httpApi:
+          path: /agent/assignments/{campaign}/publications
+          method: get
+          authorizer:
+            name: cognitoAgentJwt
+
+  # add-agent-send-history: resultados por contacto del CLI y su historial
+  agentPostResults:
+    handler: src/handlers/agentResults.postResults
+    events:
+      - httpApi:
+          path: /agent/results
+          method: post
+          authorizer:
+            name: cognitoAgentJwt
+
+  agentGetResults:
+    handler: src/handlers/agentResults.getOwnResults
+    timeout: 29
+    events:
+      - httpApi:
+          path: /agent/results/{campaign}
+          method: get
+          authorizer:
+            name: cognitoAgentJwt
+
+  adminGetCampaignResults:
+    handler: src/handlers/agentResults.getCampaignResults
+    timeout: 29
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/results
+          method: get
+          authorizer:
+            name: cognitoAdminJwt
+
+  # add-whatsapp-status-registry: registro de estado de WhatsApp por teléfono
+  agentPostWaStatus:
+    handler: src/handlers/waStatus.agentMark
+    events:
+      - httpApi:
+          path: /agent/wa-status
+          method: post
+          authorizer:
+            name: cognitoAgentJwt
+
+  agentLookupWaStatus:
+    handler: src/handlers/waStatus.agentLookup
+    timeout: 29
+    events:
+      - httpApi:
+          path: /agent/wa-status/lookup
+          method: post
+          authorizer:
+            name: cognitoAgentJwt
+
+  adminPostWaStatus:
+    handler: src/handlers/waStatus.adminMark
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/wa-status
+          method: post
+          authorizer:
+            name: cognitoAdminJwt
+
+  adminLookupWaStatus:
+    handler: src/handlers/waStatus.adminLookup
+    timeout: 29
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/wa-status/lookup
+          method: post
+          authorizer:
+            name: cognitoAdminJwt
+
+  # add-cli-remote-settings
+  adminGetCliSettings:
+    handler: src/handlers/cliSettings.getCliSettings
+    events:
+      - httpApi:
+          path: /admin/cli-settings
+          method: get
+          authorizer:
+            name: cognitoAdminJwt
+
+  adminUpdateCliSettings:
+    handler: src/handlers/cliSettings.updateCliSettingsHandler
+    events:
+      - httpApi:
+          path: /admin/cli-settings
+          method: post
+          authorizer:
+            name: cognitoAdminJwt
+
+  # add-legacy-chat-history (solo lectura)
+  adminSearchLegacyChats:
+    handler: src/handlers/adminLegacyChats.searchLegacyChats
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/legacy-chats
+          method: get
+          authorizer:
+            name: cognitoAdminJwt
+
+  adminGetLegacyChat:
+    handler: src/handlers/adminLegacyChats.getLegacyChat
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/legacy-chats/{agent}/{phone}
+          method: get
+          authorizer:
+            name: cognitoAdminJwt
+
+  adminGetLegacyAgents:
+    handler: src/handlers/adminLegacyChats.getLegacyAgents
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/legacy-agents
+          method: get
+          authorizer:
+            name: cognitoAdminJwt
+
+  # link-review-contacts-to-uploads
+  adminListReviewItems:
+    handler: src/handlers/adminReview.listReview
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/review-items
+          method: get
+          authorizer:
+            name: cognitoAdminJwt
+
+  adminResolveReviewItems:
+    handler: src/handlers/adminReview.resolveReview
+    events:
+      - httpApi:
+          path: /admin/campaigns/{campaign}/review-items/resolve
+          method: post
+          authorizer:
+            name: cognitoAdminJwt
+
+resources:
+  # Puente realtime v3 → v4 (add-realtime-gateway D7): la regla y su rol solo
+  # se crean con --param="realtimeBusArn=<salida RealtimeBusArn del stack v4>".
+  Conditions:
+    HasRealtimeBus:
+      Fn::Not:
+        - Fn::Equals:
+            - '${param:realtimeBusArn, ""}'
+            - ''
+  Resources:
+    StorageBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:service}-storage-${sls:stage}
+        # Eventos de objeto al bus por defecto de us-east-1 (sin costo de entrega);
+        # la regla RealtimeBridgeRule reenvía solo los prefijos del puente.
+        NotificationConfiguration:
+          EventBridgeConfiguration:
+            EventBridgeEnabled: true
+        # support-crm-base-upload: el navegador de ANA Admin sube el CSV maestro
+        # de una carga grande con la URL firmada (PUT directo, sin pasar por el BFF).
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - https://ana-admin.pernexium.com.mx
+              AllowedMethods:
+                - PUT
+              AllowedHeaders:
+                - content-type
+              MaxAge: 3600
+        LifecycleConfiguration:
+          Rules:
+            # Historial de envíos (add-agent-send-history D10): retención de 180 días.
+            - Id: ExpireSendResults
+              Status: Enabled
+              Prefix: results/
+              ExpirationInDays: 180
+            # CSV maestros que no se procesaron (carga cancelada o fallida).
+            - Id: expire-uploads-incoming
+              Status: Enabled
+              Prefix: uploads-incoming/
+              ExpirationInDays: 1
+
+    # Registro de estado de WhatsApp por teléfono (add-whatsapp-status-registry D1).
+    # Retain: borrar el stack no borra el historial de marcas.
+    WaStatusTable:
+      Type: AWS::DynamoDB::Table
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+      Properties:
+        TableName: ${self:service}-wa-status-${sls:stage}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: phone
+            AttributeType: S
+        KeySchema:
+          - AttributeName: phone
+            KeyType: HASH
+        PointInTimeRecoverySpecification:
+          PointInTimeRecoveryEnabled: true
+        SSESpecification:
+          SSEEnabled: true
+
+    # Reenvía, entre regiones, los cambios relevantes al bus realtime de v4
+    # (us-east-2). Ningún handler v3 cambia; si la regla falla o se deshabilita,
+    # v3 y sus clientes se comportan igual (spec v3/realtime-bridge).
+    RealtimeBridgeRole:
+      Type: AWS::IAM::Role
+      Condition: HasRealtimeBus
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Principal: { Service: events.amazonaws.com }
+              Action: sts:AssumeRole
+        Policies:
+          - PolicyName: realtime-bridge-put-events
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - events:PutEvents
+                  Resource:
+                    - '${param:realtimeBusArn, ""}'
+
+    RealtimeBridgeRule:
+      Type: AWS::Events::Rule
+      Condition: HasRealtimeBus
+      Properties:
+        Name: ${self:service}-${sls:stage}-realtime-bridge
+        Description: Cambios de S3 de v3 hacia el canal realtime de v4 (add-realtime-gateway)
+        EventBusName: default
+        State: ENABLED
+        EventPattern:
+          source:
+            - aws.s3
+          detail-type:
+            - Object Created
+            - Object Deleted
+          detail:
+            bucket:
+              name:
+                - ${self:service}-storage-${sls:stage}
+            object:
+              key:
+                - prefix: agents/
+                - prefix: assignments/agents/
+                - prefix: agent-publications/
+                - prefix: review/
+                - prefix: rosters/
+                - prefix: uploads/
+                # Lote de resultados del CLI → results.changed (add-agent-send-history D9).
+                - prefix: results/
+                - config/cli-settings.json
+                # Manifiesto del CLI publicado → release.available (add-in-session-updates).
+                - versions/latest.json
+        Targets:
+          - Id: ana-realtime-v4
+            Arn: '${param:realtimeBusArn, ""}'
+            RoleArn:
+              Fn::GetAtt: [RealtimeBridgeRole, Arn]
+
+    # Observabilidad de la autenticación de agente (migrate-cli-to-cognito-login 4.1):
+    # cada línea {"evt":"agent_auth",...} (stdout, sin prefijo) suma 1 a
+    # AnaAgentAuth/Requests con dimensiones reason y cliVersion.
+    AgentAuthMetricUploadBackup:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: UploadBackupLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-uploadBackup
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthMetricGetLatestBackup:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: GetLatestBackupLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-getLatestBackup
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthMetricSaveChatBackup:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: SaveChatBackupLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-saveChatBackup
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthMetricGetChatBackup:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: GetChatBackupLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-getChatBackup
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthMetricListChatBackups:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: ListChatBackupsLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-listChatBackups
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthMetricGetChats:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: GetChatsLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-getChats
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthMetricUploadMedia:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: UploadMediaLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-uploadMedia
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthMetricUpdatePendingContacts:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: UpdatePendingContactsLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-updatePendingContacts
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthMetricGetTemplates:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: GetTemplatesLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-getTemplates
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthMetricAgentCampaigns:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: AgentCampaignsLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-agentCampaigns
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthMetricAgentSettings:
+      Type: AWS::Logs::MetricFilter
+      DependsOn: AgentSettingsLogGroup
+      Properties:
+        LogGroupName: /aws/lambda/${self:service}-${sls:stage}-agentSettings
+        FilterPattern: '{ $.evt = "agent_auth" }'
+        MetricTransformations:
+          - MetricNamespace: AnaAgentAuth
+            MetricName: Requests
+            MetricValue: '1'
+            Unit: Count
+            Dimensions:
+              - Key: reason
+                Value: $.reason
+              - Key: cliVersion
+                Value: $.cliVersion
+    AgentAuthQuery:
+      Type: AWS::Logs::QueryDefinition
+      DependsOn:
+        - UploadBackupLogGroup
+        - GetLatestBackupLogGroup
+        - SaveChatBackupLogGroup
+        - GetChatBackupLogGroup
+        - ListChatBackupsLogGroup
+        - GetChatsLogGroup
+        - UploadMediaLogGroup
+        - UpdatePendingContactsLogGroup
+        - GetTemplatesLogGroup
+        - AgentCampaignsLogGroup
+        - AgentSettingsLogGroup
+      Properties:
+        Name: ana-backend-${sls:stage}/agent-auth
+        LogGroupNames:
+          - /aws/lambda/${self:service}-${sls:stage}-uploadBackup
+          - /aws/lambda/${self:service}-${sls:stage}-getLatestBackup
+          - /aws/lambda/${self:service}-${sls:stage}-saveChatBackup
+          - /aws/lambda/${self:service}-${sls:stage}-getChatBackup
+          - /aws/lambda/${self:service}-${sls:stage}-listChatBackups
+          - /aws/lambda/${self:service}-${sls:stage}-getChats
+          - /aws/lambda/${self:service}-${sls:stage}-uploadMedia
+          - /aws/lambda/${self:service}-${sls:stage}-updatePendingContacts
+          - /aws/lambda/${self:service}-${sls:stage}-getTemplates
+          - /aws/lambda/${self:service}-${sls:stage}-agentCampaigns
+          - /aws/lambda/${self:service}-${sls:stage}-agentSettings
+        QueryString: 'filter evt = "agent_auth" | stats count() by reason, cliVersion, agent'

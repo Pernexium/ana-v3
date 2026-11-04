@@ -1,0 +1,59 @@
+name: admin-web
+
+on:
+  pull_request:
+    paths:
+      - 'admin-web/**'
+      - '.github/workflows/admin-web.yml'
+      # Pruebas de equivalencia importan estos consumidores reales del CSV.
+      - 'v4/backend/src/lib/contacts.ts'
+      - 'v3/ana-backend/src/lib/contactsCsv.ts'
+      - 'v3/cli-whatsapp/assignment-csv.js'
+      - 'v3/cli-whatsapp/template-utils.js'
+      # Vista previa de Mi asignación ≡ publicación de v3 (add-agent-workspace).
+      - 'v3/ana-backend/src/lib/publication.ts'
+      - 'v3/ana-backend/src/lib/assignmentCsv.ts'
+      - 'v3/ana-backend/src/lib/templateRender.ts'
+  push:
+    branches: [main]
+    paths:
+      - 'admin-web/**'
+      - '.github/workflows/admin-web.yml'
+      # Pruebas de equivalencia importan estos consumidores reales del CSV.
+      - 'v4/backend/src/lib/contacts.ts'
+      - 'v3/ana-backend/src/lib/contactsCsv.ts'
+      - 'v3/cli-whatsapp/assignment-csv.js'
+      - 'v3/cli-whatsapp/template-utils.js'
+      # Vista previa de Mi asignación ≡ publicación de v3 (add-agent-workspace).
+      - 'v3/ana-backend/src/lib/publication.ts'
+      - 'v3/ana-backend/src/lib/assignmentCsv.ts'
+      - 'v3/ana-backend/src/lib/templateRender.ts'
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: admin-web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: admin-web/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run check:design
+      - run: npm run typecheck
+      - run: npm test
+      # Build con los valores FALSOS de .env.test para verificar que ningún
+      # secreto de servidor llega al bundle del navegador.
+      - name: build
+        run: |
+          set -a; . ./.env.test; set +a
+          npm run build
+      - run: npm run check:bundle

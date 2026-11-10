@@ -1,6 +1,7 @@
 import type { Metadata } from 'next';
 import type { ReactNode } from 'react';
 import { Inter } from 'next/font/google';
+import { headers } from 'next/headers';
 import { AmplifyProvider } from '@/components/system/AmplifyProvider';
 import { ToastProvider } from '@/components/ui/Toast';
 import './globals.css';
@@ -13,7 +14,9 @@ export const metadata: Metadata = {
   robots: { index: false, follow: false },
 };
 
-export default function RootLayout({ children }: { children: ReactNode }) {
+export default async function RootLayout({ children }: { children: ReactNode }) {
+  // Render por petición: Next aplica el nonce de la CSP (middleware.ts) a sus scripts.
+  await headers();
   return (
     <html lang="es-MX" className={inter.variable}>
       <body className={inter.className}>
